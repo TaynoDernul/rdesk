@@ -427,13 +427,17 @@ mod tests {
         let downloads = dir.join("downloads");
         std::fs::create_dir_all(&downloads).unwrap();
 
-        let sender = {
-            let conn = conn.clone();
-            tokio::spawn(async move { crate::client::send_file(&conn, &source).await.unwrap() })
-        };
-        let mut stream = server.accept_uni().await.unwrap();
-        let saved = crate::host::receive_file_into(&mut stream, "test", &downloads).await.unwrap();
-        assert_eq!(sender.await.unwrap(), payload.len() as u64);
+        // Downloads land in USERPROFILE\Downloads\rdesk; point it at the test folder.
+        std::env::set_var("USERPROFILE", &downloads);
+        let progress = Arc::new(crate::files::Progress::default());
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let notify: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |t| { let _ = tx.send(t); });
+        tokio::spawn(crate::files::receive_all(server.clone(), progress.clone(), notify));
+        let sent = crate::files::send_paths(&conn, &[source], false, &progress).await.unwrap();
+        assert_eq!(sent, (1, payload.len() as u64));
+        let note = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+        assert!(note.contains("payload.bin"), "{note}");
+        let saved = downloads.join("Downloads").join("rdesk").join("payload.bin");
         assert_eq!(std::fs::read(&saved).unwrap(), payload);
         std::fs::remove_dir_all(dir).unwrap();
     }

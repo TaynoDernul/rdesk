@@ -4,13 +4,13 @@ use anyhow::{bail, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const ALPN_SESSION: &[u8] = b"rdesk/3";
+pub const ALPN_SESSION: &[u8] = b"rdesk/4";
 pub const ALPN_PAIR: &[u8] = b"rdesk-pair/2";
 const MAX_MESSAGE: usize = 8 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ClientMsg {
-    Hello { max_bitrate_kbps: u32, fps: u32, clipboard: bool, pin: String },
+    Hello { max_bitrate_kbps: u32, fps: u32, clipboard: bool, audio: bool, pin: String },
     /// Normalized to 0..=65535 across the captured monitor.
     MouseMove { x: u16, y: u16 },
     MouseButton { button: u8, down: bool },
@@ -20,6 +20,13 @@ pub enum ClientMsg {
     RequestKeyframe,
     SelectMonitor { index: u8 },
     Clipboard { text: String },
+    /// New upper bound for the video bitrate, chosen in the session menu.
+    SetQuality { kbps: u32 },
+    /// Turns sound from the host on or off during the session.
+    SetAudio { on: bool },
+    /// Opens a file picker on the host's screen; the choice is sent back.
+    RequestFiles { folder: bool },
+    Chat { text: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -31,6 +38,7 @@ pub enum HostMsg {
     CursorShape(CursorShape),
     Clipboard { text: String },
     Notice { text: String },
+    Chat { text: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -43,13 +51,6 @@ pub struct CursorShape {
     pub hot_x: u32,
     pub hot_y: u32,
     pub data: Vec<u8>,
-}
-
-/// Sent first on each unidirectional file stream.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct FileHeader {
-    pub name: String,
-    pub size: u64,
 }
 
 pub async fn write_msg<W, T>(w: &mut W, msg: &T) -> Result<()>

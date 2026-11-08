@@ -4,10 +4,13 @@
 // No console window on double click. Tests keep the console for their output.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod audio;
+mod chat;
 mod client;
 mod clipboard;
 mod d3d;
 mod fec;
+mod files;
 mod gui;
 mod host;
 mod identity;
@@ -76,6 +79,9 @@ enum Command {
         /// Отключить синхронизацию буфера обмена
         #[arg(long)]
         no_clipboard: bool,
+        /// Не передавать звук с удалённого ПК
+        #[arg(long)]
+        no_audio: bool,
         /// Печатать статистику раз в секунду
         #[arg(long)]
         stats: bool,
@@ -185,7 +191,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::PairWith { id: host_id, name } => {
             runtime.block_on(pairing::run_client(&id, &host_id, &name))
         }
-        Command::Connect { name, bitrate, fps, no_clipboard, stats, duration, dialogs } => {
+        Command::Connect { name, bitrate, fps, no_clipboard, no_audio, stats, duration, dialogs } => {
             client::run(
                 runtime,
                 id,
@@ -194,6 +200,7 @@ fn run(cli: Cli) -> Result<()> {
                     bitrate_kbps: bitrate,
                     fps,
                     clipboard: !no_clipboard,
+                    audio: !no_audio,
                     stats,
                     duration,
                     dialogs,

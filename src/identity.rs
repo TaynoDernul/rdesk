@@ -162,6 +162,10 @@ pub struct Trust {
     /// Clipboard sync when connecting from the window.
     #[serde(default)]
     pub clipboard: bool,
+    /// Someone at this PC must allow each session; kept in the signed list
+    /// so that malware editing a file cannot quietly turn it off.
+    #[serde(default)]
+    pub confirm: bool,
 }
 
 /// On-disk form: the JSON body plus an HMAC keyed by a DPAPI-protected secret.

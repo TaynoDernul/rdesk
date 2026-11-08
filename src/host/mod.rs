@@ -9,15 +9,14 @@ mod video;
 
 use crate::identity::{short_id, Identity, Trust};
 use crate::pin::{PinGuard, PinRecord};
-use crate::proto::{read_msg, safe_file_name, write_msg, ClientMsg, FileHeader, HostMsg};
-use crate::{clipboard, log_event, net};
+use crate::files::{self, Progress};
+use crate::proto::{read_msg, write_msg, ClientMsg, HostMsg};
+use crate::{audio, clipboard, log_event, net};
 use anyhow::{anyhow, bail, Context, Result};
 use iroh::endpoint::{Connection, RecvStream};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Notify};
 use video::VideoShared;
 
@@ -165,7 +164,7 @@ async fn session(conn: Connection, stats: bool) -> Result<()> {
         .await
         .context("client did not open the control stream")??;
     let hello: ClientMsg = read_msg(&mut recv).await?;
-    let ClientMsg::Hello { max_bitrate_kbps, fps, clipboard: clipboard_on, pin } = hello else {
+    let ClientMsg::Hello { max_bitrate_kbps, fps, clipboard: clipboard_on, audio: audio_on, pin } = hello else {
         bail!("expected Hello");
     };
 
@@ -173,6 +172,18 @@ async fn session(conn: Connection, stats: bool) -> Result<()> {
     if let Err(reason) = check_pin(trust.pin.as_ref(), pin, &peer).await {
         conn.close(2u32.into(), reason.as_bytes());
         return Ok(());
+    }
+    let mut view_only = false;
+    if trust.confirm {
+        match ask_permission(&peer, Duration::from_secs(30)).await {
+            Some(only_view) => view_only = only_view,
+            None => {
+                log_event(&format!("session from '{peer}' refused at this PC"));
+                conn.close(2u32.into(), "на удалённом ПК подключение не разрешили".as_bytes());
+                return Ok(());
+            }
+        }
+        log_event(&format!("session from '{peer}' allowed at this PC{}", if view_only { ", view only" } else { "" }));
     }
     write_msg(&mut send, &HostMsg::Accepted).await?;
 
@@ -185,14 +196,28 @@ async fn session(conn: Connection, stats: bool) -> Result<()> {
         }
     });
 
+    let progress = Arc::new(Progress::default());
+    let (clip_tx, clip_rx) = mpsc::unbounded_channel::<clipboard::Change>();
     let disconnect = Arc::new(Notify::new());
-    let banner = indicator::start(&peer, disconnect.clone(), clipboard_on.then(|| ctl_tx.clone()));
+    let banner = indicator::start(&peer, disconnect.clone(), clipboard_on.then_some(clip_tx));
     if banner.is_none() {
         // Unattended control without the visible banner is not allowed.
         conn.close(1u32.into(), b"indicator failed");
         bail!("cannot show the session banner");
     }
     let _session = SessionGuard::new(&peer, &conn);
+    if view_only {
+        let _ = ctl_tx.send(HostMsg::Notice { text: "разрешён только просмотр".to_string() });
+    }
+    {
+        let ctl = ctl_tx.clone();
+        crate::chat::start(
+            &format!("rdesk: чат с «{peer}»"),
+            Box::new(move |text| {
+                let _ = ctl.send(HostMsg::Chat { text });
+            }),
+        );
+    }
 
     let shared = Arc::new(VideoShared {
         stop: AtomicBool::new(false),
@@ -200,7 +225,7 @@ async fn session(conn: Connection, stats: bool) -> Result<()> {
         restart: AtomicBool::new(false),
         monitor: AtomicUsize::new(0),
         rect: Mutex::new(Default::default()),
-        max_kbps: max_bitrate_kbps.clamp(1_000, 200_000),
+        max_kbps: AtomicU32::new(max_bitrate_kbps.clamp(1_000, 200_000)),
         fps: fps.clamp(10, 240),
         stats,
         frame_id: AtomicU64::new(0),
@@ -214,9 +239,20 @@ async fn session(conn: Connection, stats: bool) -> Result<()> {
             .spawn(move || video::run(conn, &shared, ctl))?
     };
 
-    let files = tokio::spawn(receive_files(conn.clone(), peer.clone()));
+    let sound = Mutex::new(audio_on.then(|| audio::Capture::start(conn.clone())));
+    let notify: Arc<dyn Fn(String) + Send + Sync> = Arc::new(set_note);
+    let files = tokio::spawn(files::receive_all(conn.clone(), progress.clone(), notify));
+    let clip = tokio::spawn(forward_clipboard(clip_rx, conn.clone(), ctl_tx.clone(), progress.clone()));
+    let context = Session {
+        conn: conn.clone(),
+        shared: shared.clone(),
+        ctl: ctl_tx.clone(),
+        progress,
+        peer: peer.clone(),
+        view_only,
+    };
     let result = tokio::select! {
-        r = input_loop(&mut recv, &shared) => r,
+        r = input_loop(&mut recv, &context, &sound) => r,
         _ = disconnect.notified() => {
             conn.close(0u32.into(), "отключено на удалённом ПК".as_bytes());
             Ok(())
@@ -229,7 +265,11 @@ async fn session(conn: Connection, stats: bool) -> Result<()> {
 
     shared.stop.store(true, Ordering::Relaxed);
     conn.close(0u32.into(), b"session ended");
+    let sound = sound.lock().expect("sound lock").take();
+    tokio::task::spawn_blocking(move || drop(sound)).await?;
     files.abort();
+    clip.abort();
+    crate::chat::close();
     writer.abort();
     if let Some(banner) = banner {
         banner.close();
@@ -243,7 +283,119 @@ async fn session(conn: Connection, stats: bool) -> Result<()> {
     result
 }
 
-async fn input_loop(recv: &mut RecvStream, shared: &VideoShared) -> Result<()> {
+/// What the message loop needs besides the stream it reads.
+struct Session {
+    conn: Connection,
+    shared: Arc<VideoShared>,
+    ctl: mpsc::UnboundedSender<HostMsg>,
+    progress: Arc<Progress>,
+    peer: String,
+    /// Allowed to watch only: input from the other side is ignored.
+    view_only: bool,
+}
+
+/// Asks whoever sits at this PC. Some(false) allows control, Some(true)
+/// allows watching only, None refuses, and so does no answer in time.
+async fn ask_permission(peer: &str, wait: Duration) -> Option<bool> {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    let text = format!(
+        "Устройство «{peer}» хочет подключиться к этому компьютеру.\n\n\
+         Да: разрешить управление\nНет: только просмотр экрана\nОтмена: отклонить\n\n\
+         Без ответа через 30 секунд подключение будет отклонено."
+    );
+    let thread = Arc::new(AtomicU32::new(0));
+    let asking = {
+        let thread = thread.clone();
+        tokio::task::spawn_blocking(move || {
+            thread.store(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }, Ordering::SeqCst);
+            let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            unsafe {
+                MessageBoxW(
+                    None,
+                    windows::core::PCWSTR(text.as_ptr()),
+                    windows::core::w!("rdesk: запрос подключения"),
+                    MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON3 | MB_TOPMOST | MB_SETFOREGROUND,
+                )
+            }
+        })
+    };
+    tokio::pin!(asking);
+    let answer = match tokio::time::timeout(wait, &mut asking).await {
+        Ok(answer) => answer.ok(),
+        Err(_) => {
+            // Press Cancel for the absent user, then collect the result.
+            unsafe extern "system" fn cancel(hwnd: windows::Win32::Foundation::HWND, _: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::BOOL {
+                let _ = PostMessageW(hwnd, WM_COMMAND, windows::Win32::Foundation::WPARAM(IDCANCEL.0 as usize), windows::Win32::Foundation::LPARAM(0));
+                true.into()
+            }
+            let _ = unsafe { EnumThreadWindows(thread.load(Ordering::SeqCst), Some(cancel), windows::Win32::Foundation::LPARAM(0)) };
+            let _ = asking.await;
+            None
+        }
+    };
+    match answer {
+        Some(IDYES) => Some(false),
+        Some(IDNO) => Some(true),
+        _ => None,
+    }
+}
+
+/// Sends what is copied on this PC: text on the control stream, pictures and
+/// files on streams of their own.
+async fn forward_clipboard(
+    mut changes: mpsc::UnboundedReceiver<clipboard::Change>,
+    conn: Connection,
+    ctl: mpsc::UnboundedSender<HostMsg>,
+    progress: Arc<Progress>,
+) {
+    while let Some(change) = changes.recv().await {
+        let result = match change {
+            clipboard::Change::Text(text) => {
+                let _ = ctl.send(HostMsg::Clipboard { text });
+                Ok(())
+            }
+            clipboard::Change::Image(dib) => files::send_image(&conn, &dib).await,
+            clipboard::Change::Files(paths) => {
+                files::send_paths(&conn, &paths, true, &progress).await.map(|_| ())
+            }
+        };
+        if let Err(e) = result {
+            let _ = ctl.send(HostMsg::Notice { text: format!("буфер обмена: {e:#}") });
+        }
+    }
+}
+
+/// Opens the file picker on this PC's screen, which the other side sees and
+/// controls, and sends what is chosen there.
+async fn send_requested(session: &Session, folder: bool) {
+    let title = if folder { "Выберите папку для отправки" } else { "Выберите файлы для отправки" };
+    let picked = tokio::task::spawn_blocking(move || {
+        let _ = unsafe {
+            windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED)
+        };
+        files::pick(None, folder, title)
+    })
+    .await
+    .unwrap_or_default();
+    if picked.is_empty() {
+        return;
+    }
+    let text = match files::send_paths(&session.conn, &picked, false, &session.progress).await {
+        Ok((count, bytes)) => {
+            log_event(&format!("sent {count} files ({bytes} bytes) to the other side"));
+            return;
+        }
+        Err(e) => format!("не удалось отправить: {e:#}"),
+    };
+    let _ = session.ctl.send(HostMsg::Notice { text });
+}
+
+async fn input_loop(
+    recv: &mut RecvStream,
+    session: &Session,
+    sound: &Mutex<Option<audio::Capture>>,
+) -> Result<()> {
+    let shared = &session.shared;
     // Dropping the injector releases held keys on every exit path.
     let mut injector = input::Injector::default();
     loop {
@@ -253,6 +405,11 @@ async fn input_loop(recv: &mut RecvStream, shared: &VideoShared) -> Result<()> {
             Err(_) => return Ok(()),
         };
         match msg {
+            ClientMsg::MouseMove { .. }
+            | ClientMsg::MouseButton { .. }
+            | ClientMsg::Wheel { .. }
+            | ClientMsg::Key { .. }
+                if session.view_only => {}
             ClientMsg::MouseMove { x, y } => {
                 let monitor = *shared.rect.lock().expect("rect lock");
                 injector.mouse_move(x, y, monitor);
@@ -271,105 +428,52 @@ async fn input_loop(recv: &mut RecvStream, shared: &VideoShared) -> Result<()> {
                     log_event(&format!("clipboard: {e:#}"));
                 }
             }
+            ClientMsg::SetQuality { kbps } => {
+                let kbps = kbps.clamp(1_000, 200_000);
+                shared.max_kbps.store(kbps, Ordering::Relaxed);
+                // Start the new pipeline at the new ceiling; rate control
+                // lowers it again if the network cannot carry it.
+                shared.current_kbps.store(kbps, Ordering::Relaxed);
+                shared.restart.store(true, Ordering::Relaxed);
+            }
+            ClientMsg::SetAudio { on } => {
+                let mut sound = sound.lock().expect("sound lock");
+                if on && sound.is_none() {
+                    *sound = Some(audio::Capture::start(session.conn.clone()));
+                } else if !on {
+                    // Stopping joins a thread that wakes every 10 ms.
+                    drop(sound.take());
+                }
+            }
+            ClientMsg::RequestFiles { folder } => {
+                // The picker waits for the user; the session goes on meanwhile.
+                let session = Session {
+                    conn: session.conn.clone(),
+                    shared: session.shared.clone(),
+                    ctl: session.ctl.clone(),
+                    progress: session.progress.clone(),
+                    peer: session.peer.clone(),
+                    view_only: session.view_only,
+                };
+                tokio::spawn(async move { send_requested(&session, folder).await });
+            }
+            ClientMsg::Chat { text } => crate::chat::incoming(&session.peer, &text),
             ClientMsg::Hello { .. } => bail!("duplicate Hello"),
         }
     }
-}
-
-fn download_dir() -> Result<PathBuf> {
-    let base = std::env::var_os("USERPROFILE").context("USERPROFILE is not set")?;
-    let dir = PathBuf::from(base).join("Downloads").join("rdesk");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-/// Picks a name that does not exist yet, so a transfer never overwrites a file.
-fn unique_path(dir: &Path, name: &str) -> PathBuf {
-    let candidate = dir.join(name);
-    if !candidate.exists() {
-        return candidate;
-    }
-    let source = Path::new(name);
-    let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let ext = source.extension().and_then(|s| s.to_str());
-    (1..)
-        .map(|i| match ext {
-            Some(ext) => dir.join(format!("{stem} ({i}).{ext}")),
-            None => dir.join(format!("{stem} ({i})")),
-        })
-        .find(|p| !p.exists())
-        .expect("unbounded search finds a free name")
-}
-
-async fn receive_files(conn: Connection, peer: String) {
-    while let Ok(mut stream) = conn.accept_uni().await {
-        let peer = peer.clone();
-        tokio::spawn(async move {
-            if let Err(e) = receive_file(&mut stream, &peer).await {
-                log_event(&format!("file transfer failed: {e:#}"));
-            }
-        });
-    }
-}
-
-async fn receive_file(stream: &mut RecvStream, peer: &str) -> Result<()> {
-    receive_file_into(stream, peer, &download_dir()?).await.map(|_| ())
-}
-
-pub(crate) async fn receive_file_into(
-    stream: &mut RecvStream,
-    peer: &str,
-    dir: &Path,
-) -> Result<PathBuf> {
-    let header: FileHeader = read_msg(stream).await?;
-    let name = safe_file_name(&header.name).ok_or_else(|| anyhow!("unsafe file name"))?;
-    let target = unique_path(dir, &name);
-    let partial = target.with_extension(format!(
-        "{}.part",
-        target.extension().and_then(|e| e.to_str()).unwrap_or("")
-    ));
-
-    let copy = async {
-        let mut file = tokio::fs::File::create(&partial).await?;
-        let mut received = 0u64;
-        let mut buffer = vec![0u8; 256 * 1024];
-        while let Some(n) = stream.read(&mut buffer).await? {
-            received += n as u64;
-            if received > header.size {
-                bail!("sender exceeded the declared size");
-            }
-            file.write_all(&buffer[..n]).await?;
-        }
-        if received != header.size {
-            bail!("transfer ended early: {received} of {} bytes", header.size);
-        }
-        file.flush().await?;
-        Ok(())
-    };
-    if let Err(e) = copy.await {
-        let _ = tokio::fs::remove_file(&partial).await;
-        return Err(e);
-    }
-    tokio::fs::rename(&partial, &target).await?;
-    log_event(&format!("file from '{peer}' saved: {}", target.display()));
-    println!("Получен файл: {}", target.display());
-    set_note(format!("Получен файл от «{peer}»: {}", target.display()));
-    Ok(target)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn unique_path_never_reuses_a_name() {
-        let dir = std::env::temp_dir().join(format!("rdesk-unique-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(unique_path(&dir, "a.txt"), dir.join("a.txt"));
-        std::fs::write(dir.join("a.txt"), b"x").unwrap();
-        assert_eq!(unique_path(&dir, "a.txt"), dir.join("a (1).txt"));
-        std::fs::write(dir.join("a (1).txt"), b"x").unwrap();
-        assert_eq!(unique_path(&dir, "a.txt"), dir.join("a (2).txt"));
-        std::fs::remove_dir_all(&dir).unwrap();
+    /// Shows a real question box for a second, so it is not run by default:
+    /// cargo test unanswered_question -- --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn unanswered_question_refuses_and_closes() {
+        let started = std::time::Instant::now();
+        assert_eq!(ask_permission("тест", Duration::from_secs(1)).await, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

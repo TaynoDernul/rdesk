@@ -162,20 +162,56 @@ fn ui_settings_path() -> Result<std::path::PathBuf> {
     Ok(crate::identity::config_dir()?.join("ui.json"))
 }
 
+/// Window preferences in ui.json. They are not security settings, so unlike
+/// the device list they are not signed; a missing or odd file means defaults.
+fn ui_settings() -> serde_json::Map<String, serde_json::Value> {
+    let read = || -> Option<serde_json::Map<String, serde_json::Value>> {
+        let text = std::fs::read_to_string(ui_settings_path().ok()?).ok()?;
+        serde_json::from_str::<serde_json::Value>(&text).ok()?.as_object().cloned()
+    };
+    read().unwrap_or_default()
+}
+
+pub fn ui_setting(key: &str) -> Option<serde_json::Value> {
+    ui_settings().remove(key)
+}
+
+/// Changes one preference and keeps the others.
+pub fn save_ui_setting(key: &str, value: serde_json::Value) -> Result<()> {
+    let mut all = ui_settings();
+    all.insert(key.to_string(), value);
+    std::fs::write(ui_settings_path()?, serde_json::to_vec_pretty(&all)?)?;
+    Ok(())
+}
+
+/// "08.11 14:03" in this PC's time zone, for the connection log.
+pub fn local_time_text(unix_secs: u64) -> String {
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+    let ticks = (unix_secs + 11_644_473_600) * 10_000_000;
+    let file = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+    let (mut utc, mut local) = (SYSTEMTIME::default(), SYSTEMTIME::default());
+    let converted = unsafe {
+        FileTimeToSystemTime(&file, &mut utc).is_ok()
+            && SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).is_ok()
+    };
+    if !converted {
+        return String::new();
+    }
+    format!("{:02}.{:02} {:02}:{:02}", local.wDay, local.wMonth, local.wHour, local.wMinute)
+}
+
+pub fn ui_flag(key: &str, default: bool) -> bool {
+    ui_setting(key).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
 /// 0 = like Windows, 1 = light, 2 = dark. A missing or odd file means 0.
 pub fn theme_setting() -> u8 {
-    let read = || -> Option<u8> {
-        let text = std::fs::read_to_string(ui_settings_path().ok()?).ok()?;
-        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-        value.get("theme")?.as_u64().filter(|t| *t <= 2).map(|t| t as u8)
-    };
-    read().unwrap_or(0)
+    ui_setting("theme").and_then(|v| v.as_u64()).filter(|t| *t <= 2).map_or(0, |t| t as u8)
 }
 
 pub fn save_theme_setting(theme: u8) -> Result<()> {
-    let body = serde_json::json!({ "theme": theme.min(2) });
-    std::fs::write(ui_settings_path()?, serde_json::to_vec_pretty(&body)?)?;
-    Ok(())
+    save_ui_setting("theme", serde_json::json!(theme.min(2)))
 }
 
 fn read_dword(subkey: &str, name: &str) -> Option<u32> {

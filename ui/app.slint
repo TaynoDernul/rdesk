@@ -7,6 +7,11 @@ export struct Device {
     detail: string,
 }
 
+export struct LogEntry {
+    time: string,
+    text: string,
+}
+
 component Card inherits Rectangle {
     in property <string> title;
     in property <string> subtitle;
@@ -158,12 +163,16 @@ export component AppWindow inherits Window {
     in property <string> host-note;
     in property <[Device]> clients;
     in-out property <bool> autostart;
+    in-out property <bool> confirm;
+    in property <[LogEntry]> log-entries;
+    in-out property <bool> show-log;
 
     in property <[Device]> hosts;
     in-out property <int> selected-host: -1;
     in-out property <string> pin-input;
     in-out property <int> quality-index: 1;
     in-out property <bool> clipboard;
+    in-out property <bool> audio: true;
     in-out property <string> new-id;
     in-out property <string> new-name;
     in-out property <string> new-code;
@@ -176,9 +185,12 @@ export component AppWindow inherits Window {
     callback toggle-pairing();
     callback revoke(int);
     callback autostart-changed(bool);
+    callback confirm-changed(bool);
+    callback open-log();
     callback connect();
     callback forget(int);
     callback clipboard-changed(bool);
+    callback audio-changed(bool);
     callback add-host();
     callback theme-changed(int);
 
@@ -219,6 +231,13 @@ export component AppWindow inherits Window {
                 }
             }
             Rectangle { horizontal-stretch: 1; }
+            VerticalLayout {
+                alignment: center;
+                Button {
+                    text: "Журнал подключений";
+                    clicked => { root.open-log(); }
+                }
+            }
             VerticalLayout {
                 alignment: center;
                 ComboBox {
@@ -333,6 +352,18 @@ export component AppWindow inherits Window {
                         toggled => { root.autostart-changed(self.checked); }
                     }
                 }
+                HorizontalLayout {
+                    spacing: 10px;
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        Note { text: "Спрашивать разрешение на этом ПК при каждом подключении"; }
+                    }
+                    Switch {
+                        checked <=> root.confirm;
+                        toggled => { root.confirm-changed(self.checked); }
+                    }
+                }
             }
 
             // Right column: other PCs.
@@ -384,6 +415,18 @@ export component AppWindow inherits Window {
                             toggled => { root.clipboard-changed(self.checked); }
                         }
                     }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Note { text: "Звук с удалённого компьютера"; }
+                        }
+                        Switch {
+                            checked <=> root.audio;
+                            toggled => { root.audio-changed(self.checked); }
+                        }
+                    }
                     Button {
                         text: "Подключиться";
                         primary: true;
@@ -428,6 +471,57 @@ export component AppWindow inherits Window {
             font-size: 11px;
             wrap: word-wrap;
             color: Palette.foreground.with-alpha(0.55);
+        }
+    }
+
+    // Connection log, over everything else while open.
+    if root.show-log: Rectangle {
+        background: Palette.background.with-alpha(0.7);
+        TouchArea { clicked => { root.show-log = false; } }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(620px, parent.width - 40px);
+            height: min(520px, parent.height - 40px);
+            // Clicks on the card itself do not close it.
+            TouchArea { }
+        Card {
+            width: parent.width;
+            height: parent.height;
+            title: "Журнал подключений";
+            subtitle: "Кто и когда подключался к этому ПК и куда подключались отсюда. Новые записи сверху.";
+            VerticalLayout {
+                vertical-stretch: 1;
+                if root.log-entries.length == 0: EmptyHint { text: "Записей пока нет"; }
+                if root.log-entries.length > 0: ListView {
+                    for entry in root.log-entries: HorizontalLayout {
+                        padding-top: 4px;
+                        padding-bottom: 4px;
+                        spacing: 12px;
+                        Text {
+                            text: entry.time;
+                            width: 96px;
+                            font-size: 12px;
+                            color: Palette.alternate-foreground.with-alpha(0.6);
+                        }
+                        Text {
+                            text: entry.text;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                            horizontal-stretch: 1;
+                            color: Palette.alternate-foreground;
+                        }
+                    }
+                }
+            }
+            HorizontalLayout {
+                alignment: end;
+                Button {
+                    text: "Закрыть";
+                    clicked => { root.show-log = false; }
+                }
+            }
+        }
         }
     }
 }

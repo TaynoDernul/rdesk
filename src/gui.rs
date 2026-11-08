@@ -192,9 +192,16 @@ fn connect_callbacks(ui: &AppWindow) {
     ui.on_toggle_pairing(|| with_app(toggle_pairing));
     ui.on_revoke(|index| with_app(|app| revoke_client(app, index)));
     ui.on_autostart_changed(|on| with_app(|app| toggle_autostart(app, on)));
+    ui.on_confirm_changed(|on| with_app(|app| toggle_confirm(app, on)));
+    ui.on_open_log(|| with_app(open_log));
     ui.on_connect(|| with_app(connect));
     ui.on_forget(|index| with_app(|app| forget_host(app, index)));
     ui.on_clipboard_changed(|on| with_app(|app| toggle_clipboard(app, on)));
+    ui.on_audio_changed(|on| {
+        if let Err(e) = system::save_ui_setting("audio", serde_json::json!(on)) {
+            crate::log_event(&format!("audio setting not saved: {e:#}"));
+        }
+    });
     ui.on_add_host(|| with_app(add_host));
     ui.on_theme_changed(|index| {
         if let Err(e) = system::save_theme_setting(index.clamp(0, 2) as u8) {
@@ -262,7 +269,9 @@ fn refresh_settings(app: &App) {
     let trust = Trust::load().unwrap_or_default();
     app.ui.set_pin_set(trust.pin.is_some());
     app.ui.set_clipboard(trust.clipboard);
+    app.ui.set_audio(system::ui_flag("audio", true));
     app.ui.set_autostart(system::autostart_enabled());
+    app.ui.set_confirm(trust.confirm);
 }
 
 fn refresh_status(app: &App) {
@@ -320,6 +329,87 @@ fn toggle_clipboard(app: &Rc<App>, wanted: bool) {
         app.ui.set_client_status(format!("Не удалось сохранить настройку: {e:#}").into());
         app.ui.set_clipboard(!wanted);
     }
+}
+
+fn toggle_confirm(app: &Rc<App>, wanted: bool) {
+    let saved = Trust::load().and_then(|mut trust| {
+        trust.confirm = wanted;
+        trust.save()
+    });
+    match saved {
+        Ok(()) => crate::log_event(if wanted { "confirmation turned on" } else { "confirmation turned off" }),
+        Err(e) => {
+            note(app, &format!("Не удалось сохранить настройку: {e:#}"));
+            app.ui.set_confirm(!wanted);
+        }
+    }
+}
+
+/// Turns a line of rdesk.log into words for the journal, or None for lines
+/// that only matter when debugging.
+fn describe_log(message: &str) -> Option<String> {
+    let quoted = |rest: &str| rest.split('\'').nth(1).unwrap_or("?").to_string();
+    let text = if let Some(rest) = message.strip_prefix("session started: ") {
+        format!("Подключилось устройство «{}»", quoted(rest))
+    } else if let Some(rest) = message.strip_prefix("session ended: ") {
+        format!("Сеанс с «{}» завершён", quoted(rest))
+    } else if let Some(rest) = message.strip_prefix("wrong PIN from ") {
+        format!("Неверный PIN с устройства «{}»", quoted(rest))
+    } else if let Some(rest) = message.strip_prefix("refused ") {
+        format!("Отклонено подключение «{}»", quoted(rest))
+    } else if let Some(rest) = message.strip_prefix("rejected unpaired client ") {
+        format!("Отклонено неизвестное устройство {rest}")
+    } else if let Some(rest) = message.strip_prefix("session from ") {
+        let who = quoted(rest);
+        if rest.ends_with("refused at this PC") {
+            format!("На этом ПК отказано устройству «{who}»")
+        } else if rest.ends_with("view only") {
+            format!("На этом ПК разрешён только просмотр для «{who}»")
+        } else {
+            format!("На этом ПК разрешено подключение «{who}»")
+        }
+    } else if let Some(rest) = message.strip_prefix("paired client ") {
+        format!("Добавлено устройство «{}»", quoted(rest))
+    } else if let Some(rest) = message.strip_prefix("revoked client ") {
+        format!("Отозван доступ у «{}»", quoted(rest))
+    } else if let Some(rest) = message.strip_prefix("connected to ") {
+        format!("Вы подключились к «{}»", quoted(rest))
+    } else if message == "client session ended" {
+        "Ваш сеанс завершён".to_string()
+    } else if message == "PIN changed" {
+        "PIN изменён".to_string()
+    } else if message == "session ended from the banner on this PC" {
+        "Сеанс завершён кнопкой «Отключить» на этом ПК".to_string()
+    } else if message.starts_with("received ") && message.contains(" files into ") {
+        format!("Получены файлы: {}", message.trim_start_matches("received "))
+    } else {
+        return None;
+    };
+    Some(text)
+}
+
+const LOG_LIMIT: usize = 300;
+
+fn log_entries(log: &str) -> Vec<LogEntry> {
+    let mut entries: Vec<LogEntry> = log
+        .lines()
+        .filter_map(|line| {
+            let (secs, message) = line.split_once(' ')?;
+            let text = describe_log(message)?;
+            Some(LogEntry { time: system::local_time_text(secs.parse().ok()?).into(), text: text.into() })
+        })
+        .collect();
+    entries.reverse();
+    entries.truncate(LOG_LIMIT);
+    entries
+}
+
+fn open_log(app: &Rc<App>) {
+    let text = crate::identity::config_dir()
+        .and_then(|dir| Ok(std::fs::read_to_string(dir.join("rdesk.log"))?))
+        .unwrap_or_default();
+    app.ui.set_log_entries(ModelRc::new(VecModel::from(log_entries(&text))));
+    app.ui.set_show_log(true);
 }
 
 fn toggle_autostart(app: &Rc<App>, wanted: bool) {
@@ -421,10 +511,14 @@ fn connect(app: &Rc<App>) {
     let quality = app.ui.get_quality_index().clamp(0, 2) as usize;
     let bitrate = QUALITY_KBPS[quality].to_string();
     let clipboard = app.ui.get_clipboard();
+    let audio = app.ui.get_audio();
     let spawned = std::env::current_exe().and_then(|exe| {
         let mut args = vec!["connect", "--dialogs", "--bitrate", &bitrate];
         if !clipboard {
             args.push("--no-clipboard");
+        }
+        if !audio {
+            args.push("--no-audio");
         }
         args.extend(["--", &host.name]);
         let mut child = std::process::Command::new(exe)
@@ -663,6 +757,26 @@ mod tests {
         assert_eq!(name, &id[..8]);
         let (_, name, _) = validate_new_host(&id, "Дом", "12345678").unwrap();
         assert_eq!(name, "Дом");
+    }
+
+    #[test]
+    fn log_lines_become_readable_entries() {
+        let log = "100 session started: 'ноут' abcd1234\n\
+                   101 encoder: AMD 1920x1080\n\
+                   102 wrong PIN from 'ноут', attempts left: 4\n\
+                   103 session from 'ноут' allowed at this PC, view only\n\
+                   104 session ended: 'ноут'\n";
+        let entries = log_entries(log);
+        let texts: Vec<String> = entries.iter().map(|e| e.text.to_string()).collect();
+        assert_eq!(
+            texts,
+            [
+                "Сеанс с «ноут» завершён",
+                "На этом ПК разрешён только просмотр для «ноут»",
+                "Неверный PIN с устройства «ноут»",
+                "Подключилось устройство «ноут»",
+            ]
+        );
     }
 
     #[test]

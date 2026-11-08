@@ -267,7 +267,7 @@ pub struct VideoShared {
     pub restart: AtomicBool,
     pub monitor: AtomicUsize,
     pub rect: Mutex<RECT>,
-    pub max_kbps: u32,
+    pub max_kbps: AtomicU32,
     pub fps: u32,
     pub stats: bool,
     pub frame_id: AtomicU64,
@@ -390,16 +390,17 @@ fn pipeline(
     }
 
     let relayed = crate::net::route_info(conn).is_some_and(|(_, relay)| relay);
+    let max_kbps = shared.max_kbps.load(Ordering::Relaxed);
     let kbps = match shared.current_kbps.load(Ordering::Relaxed) {
-        0 if relayed => shared.max_kbps.min(RELAY_START_KBPS),
-        0 => shared.max_kbps,
-        chosen => chosen,
+        0 if relayed => max_kbps.min(RELAY_START_KBPS),
+        0 => max_kbps,
+        chosen => chosen.min(max_kbps),
     };
     let fps = match shared.current_fps.load(Ordering::Relaxed) {
         0 => shared.fps,
         chosen => chosen,
     };
-    let mut rate = RateControl::new(shared.max_kbps, shared.fps, kbps, fps, Instant::now());
+    let mut rate = RateControl::new(max_kbps, shared.fps, kbps, fps, Instant::now());
     let mut encoder =
         Encoder::new(&device, adapter_desc.AdapterLuid, width, height, shared.fps, kbps)
             .context("cannot start hardware H.264 encoder")?;
@@ -496,7 +497,7 @@ fn pipeline(
             // about the new path, so start over at full quality.
             if on_relay && route.is_some_and(|(_, relay)| !relay) {
                 crate::log_event("moved to a direct path; restarting at full bitrate");
-                shared.current_kbps.store(shared.max_kbps, Ordering::Relaxed);
+                shared.current_kbps.store(max_kbps, Ordering::Relaxed);
                 shared.current_fps.store(shared.fps, Ordering::Relaxed);
                 shared.force_key.store(true, Ordering::Relaxed);
                 return Ok(());

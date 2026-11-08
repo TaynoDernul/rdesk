@@ -14,6 +14,7 @@ use windows::Win32::Graphics::Gdi::{
     CreateBitmap, DeleteObject, GetMonitorInfoW, MonitorFromWindow, HBITMAP, MONITORINFO,
     MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT};
@@ -30,7 +31,8 @@ const KEY_M: u32 = 0x4D;
 const KEY_Q: u32 = 0x51;
 
 static OUTBOX: OnceLock<UnboundedSender<ClientMsg>> = OnceLock::new();
-static FILES: OnceLock<UnboundedSender<PathBuf>> = OnceLock::new();
+static FILES: OnceLock<UnboundedSender<Vec<PathBuf>>> = OnceLock::new();
+static CLIP: OnceLock<UnboundedSender<crate::clipboard::Change>> = OnceLock::new();
 static HWND_VALUE: AtomicIsize = AtomicIsize::new(0);
 static VIDEO_W: AtomicU32 = AtomicU32::new(0);
 static VIDEO_H: AtomicU32 = AtomicU32::new(0);
@@ -46,6 +48,30 @@ static SHIFT: AtomicBool = AtomicBool::new(false);
 static BUTTONS_DOWN: AtomicU32 = AtomicU32::new(0);
 static SAVED_PLACEMENT: Mutex<Option<(WINDOW_STYLE, RECT)>> = Mutex::new(None);
 static CLOSING: AtomicBool = AtomicBool::new(false);
+/// Input stays on this PC: nothing is sent but the hotkeys still work.
+static VIEW_ONLY: AtomicBool = AtomicBool::new(false);
+/// While the session menu is open, keys go to the menu, not the remote PC.
+static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+static QUALITY_KBPS: AtomicU32 = AtomicU32::new(0);
+static AUDIO_ON: AtomicBool = AtomicBool::new(true);
+
+/// Choices offered in the session menu; the same as in the main window.
+pub const QUALITIES: [(u32, &str); 3] = [
+    (8_000, "Экономно · 8 Мбит/с"),
+    (20_000, "Обычно · 20 Мбит/с"),
+    (40_000, "Максимум · 40 Мбит/с"),
+];
+const ID_FULLSCREEN: usize = 1;
+const ID_VIEW_ONLY: usize = 2;
+const ID_SEND_FILES: usize = 3;
+const ID_DISCONNECT: usize = 4;
+const ID_AUDIO: usize = 5;
+const ID_SEND_FOLDER: usize = 6;
+const ID_GET_FILES: usize = 7;
+const ID_GET_FOLDER: usize = 8;
+const ID_CHAT: usize = 9;
+const ID_MONITOR: usize = 100;
+const ID_QUALITY: usize = 200;
 
 /// True once the window is going away; presenting to it then fails harmlessly.
 pub fn is_closing() -> bool {
@@ -106,11 +132,17 @@ pub fn set_title(text: &str) {
 pub fn create(
     title: &str,
     outbox: UnboundedSender<ClientMsg>,
-    files: UnboundedSender<PathBuf>,
+    files: UnboundedSender<Vec<PathBuf>>,
+    clip: UnboundedSender<crate::clipboard::Change>,
     clipboard: bool,
+    bitrate_kbps: u32,
+    audio: bool,
 ) -> Result<HWND> {
+    QUALITY_KBPS.store(bitrate_kbps, Ordering::Relaxed);
+    AUDIO_ON.store(audio, Ordering::Relaxed);
     OUTBOX.set(outbox).map_err(|_| anyhow!("window already created"))?;
     FILES.set(files).map_err(|_| anyhow!("window already created"))?;
+    CLIP.set(clip).map_err(|_| anyhow!("window already created"))?;
     CLIPBOARD_ON.store(clipboard, Ordering::Relaxed);
     let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
@@ -143,6 +175,9 @@ pub fn create(
         HWND_VALUE.store(hwnd.0 as isize, Ordering::Relaxed);
         crate::system::apply_title_theme(hwnd);
         DragAcceptFiles(hwnd, true);
+        // The file picker is a COM dialog and needs an apartment on this thread.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        super::toolbar::create(hwnd);
         if clipboard {
             let _ = AddClipboardFormatListener(hwnd);
         }
@@ -172,7 +207,7 @@ pub fn message_loop() {
 }
 
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code < 0 || GetForegroundWindow() != hwnd() {
+    if code < 0 || GetForegroundWindow() != hwnd() || MENU_OPEN.load(Ordering::Relaxed) {
         return CallNextHookEx(None, code, wparam, lparam);
     }
     let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
@@ -203,6 +238,9 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             }
         }
         return LRESULT(1);
+    }
+    if VIEW_ONLY.load(Ordering::Relaxed) {
+        return CallNextHookEx(None, code, wparam, lparam);
     }
 
     send(ClientMsg::Key {
@@ -258,6 +296,104 @@ fn toggle_fullscreen() {
     }
 }
 
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn add_item(menu: HMENU, id: usize, text: &str, checked: bool) {
+    let flags = if checked { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let text = wide(text);
+    let _ = unsafe { AppendMenuW(menu, flags, id, PCWSTR(text.as_ptr())) };
+}
+
+fn add_submenu(menu: HMENU, sub: HMENU, text: &str) {
+    let text = wide(text);
+    let _ = unsafe { AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(text.as_ptr())) };
+}
+
+/// Opens the session menu at a screen position and carries out the choice.
+pub fn show_menu(x: i32, y: i32) {
+    let command = unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        let fullscreen = SAVED_PLACEMENT.lock().expect("placement lock").is_some();
+        add_item(menu, ID_FULLSCREEN, "Полный экран\tCtrl+Alt+Shift+F", fullscreen);
+        let monitors = MONITORS.load(Ordering::Relaxed).max(1);
+        if monitors > 1 {
+            if let Ok(sub) = CreatePopupMenu() {
+                let current = MONITOR.load(Ordering::Relaxed);
+                for i in 0..monitors {
+                    add_item(sub, ID_MONITOR + i as usize, &format!("Монитор {}", i + 1), i == current);
+                }
+                add_submenu(menu, sub, "Монитор\tCtrl+Alt+Shift+M");
+            }
+        }
+        if let Ok(sub) = CreatePopupMenu() {
+            let current = QUALITY_KBPS.load(Ordering::Relaxed);
+            for (i, (kbps, label)) in QUALITIES.iter().enumerate() {
+                add_item(sub, ID_QUALITY + i, label, *kbps == current);
+            }
+            add_submenu(menu, sub, "Качество");
+        }
+        add_item(menu, ID_AUDIO, "Звук с удалённого ПК", AUDIO_ON.load(Ordering::Relaxed));
+        add_item(menu, ID_VIEW_ONLY, "Только просмотр", VIEW_ONLY.load(Ordering::Relaxed));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        add_item(menu, ID_CHAT, "Чат…", false);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        add_item(menu, ID_SEND_FILES, "Отправить файлы…", false);
+        add_item(menu, ID_SEND_FOLDER, "Отправить папку…", false);
+        add_item(menu, ID_GET_FILES, "Скачать файлы с удалённого ПК…", false);
+        add_item(menu, ID_GET_FOLDER, "Скачать папку с удалённого ПК…", false);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        add_item(menu, ID_DISCONNECT, "Отключиться\tCtrl+Alt+Shift+Q", false);
+
+        // Held modifiers would otherwise stay down on the remote PC.
+        send(ClientMsg::ReleaseAll);
+        MENU_OPEN.store(true, Ordering::Relaxed);
+        let _ = SetForegroundWindow(hwnd());
+        let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTBUTTON, x, y, 0, hwnd(), None);
+        MENU_OPEN.store(false, Ordering::Relaxed);
+        let _ = DestroyMenu(menu);
+        chosen.0 as usize
+    };
+    match command {
+        0 => {}
+        ID_FULLSCREEN => toggle_fullscreen(),
+        ID_VIEW_ONLY => {
+            let now = !VIEW_ONLY.load(Ordering::Relaxed);
+            VIEW_ONLY.store(now, Ordering::Relaxed);
+            if now {
+                send(ClientMsg::ReleaseAll);
+            }
+        }
+        ID_SEND_FILES | ID_SEND_FOLDER => {
+            let folder = command == ID_SEND_FOLDER;
+            let picked = crate::files::pick(Some(hwnd()), folder, "Отправить на удалённый ПК");
+            if let (false, Some(files)) = (picked.is_empty(), FILES.get()) {
+                let _ = files.send(picked);
+            }
+        }
+        // The picker opens on the remote screen, where it is chosen as usual.
+        ID_GET_FILES => send(ClientMsg::RequestFiles { folder: false }),
+        ID_GET_FOLDER => send(ClientMsg::RequestFiles { folder: true }),
+        ID_DISCONNECT => post(WM_CLOSE),
+        ID_CHAT => crate::chat::show(),
+        ID_AUDIO => {
+            let on = !AUDIO_ON.load(Ordering::Relaxed);
+            AUDIO_ON.store(on, Ordering::Relaxed);
+            send(ClientMsg::SetAudio { on });
+        }
+        id if (ID_QUALITY..ID_QUALITY + QUALITIES.len()).contains(&id) => {
+            let kbps = QUALITIES[id - ID_QUALITY].0;
+            QUALITY_KBPS.store(kbps, Ordering::Relaxed);
+            send(ClientMsg::SetQuality { kbps });
+        }
+        id if (ID_MONITOR..ID_MONITOR + 64).contains(&id) => {
+            send(ClientMsg::SelectMonitor { index: (id - ID_MONITOR) as u8 });
+        }
+        _ => {}
+    }
+}
+
 /// Converts a window position to 0..=65535 inside the letterboxed picture.
 pub fn normalize(x: i32, y: i32, video: (u32, u32), window: (u32, u32)) -> (u16, u16) {
     let area = d3d::letterbox(video, window);
@@ -276,6 +412,9 @@ fn mouse_position(lparam: LPARAM) -> (i32, i32) {
 }
 
 unsafe fn send_mouse_move(hwnd: HWND, lparam: LPARAM) {
+    if VIEW_ONLY.load(Ordering::Relaxed) {
+        return;
+    }
     let Some(video) = video_size() else { return };
     let mut client = RECT::default();
     let _ = GetClientRect(hwnd, &mut client);
@@ -285,6 +424,9 @@ unsafe fn send_mouse_move(hwnd: HWND, lparam: LPARAM) {
 }
 
 unsafe fn button(hwnd: HWND, index: u8, down: bool, lparam: LPARAM) {
+    if VIEW_ONLY.load(Ordering::Relaxed) {
+        return;
+    }
     send_mouse_move(hwnd, lparam);
     send(ClientMsg::MouseButton { button: index, down });
     // Keeps receiving mouse-up when a drag leaves the window.
@@ -395,18 +537,20 @@ fn build_cursor(shape: &CursorShape) -> Result<HCURSOR> {
     }
 }
 
+/// Files and folders dropped together are sent as one batch.
 unsafe fn handle_drop(hdrop: HDROP) {
     let count = DragQueryFileW(hdrop, u32::MAX, None);
+    let mut paths = Vec::new();
     for i in 0..count {
         let len = DragQueryFileW(hdrop, i, None) as usize;
         let mut buffer = vec![0u16; len + 1];
         let copied = DragQueryFileW(hdrop, i, Some(&mut buffer)) as usize;
-        let path = PathBuf::from(String::from_utf16_lossy(&buffer[..copied]));
-        if let Some(files) = FILES.get() {
-            let _ = files.send(path);
-        }
+        paths.push(PathBuf::from(String::from_utf16_lossy(&buffer[..copied])));
     }
     DragFinish(hdrop);
+    if let (false, Some(files)) = (paths.is_empty(), FILES.get()) {
+        let _ = files.send(paths);
+    }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -428,7 +572,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
             let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
-            send(ClientMsg::Wheel { delta, horizontal: msg == WM_MOUSEHWHEEL });
+            if !VIEW_ONLY.load(Ordering::Relaxed) {
+                send(ClientMsg::Wheel { delta, horizontal: msg == WM_MOUSEHWHEEL });
+            }
             LRESULT(0)
         }
         // Dropping focus must not leave modifiers held on the remote PC.
@@ -457,11 +603,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_CLIPBOARDUPDATE => {
             if CLIPBOARD_ON.load(Ordering::Relaxed) {
-                if let Some(text) = crate::clipboard::take_local_change() {
-                    send(ClientMsg::Clipboard { text });
+                if let (Some(change), Some(clip)) = (crate::clipboard::take_local_change(), CLIP.get()) {
+                    let _ = clip.send(change);
                 }
             }
             LRESULT(0)
+        }
+        WM_MOVE | WM_SIZE => {
+            super::toolbar::follow();
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         // The swap chain covers the whole client area.
         WM_ERASEBKGND => LRESULT(1),
