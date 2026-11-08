@@ -34,6 +34,10 @@
 
 **Проверка связи:** в командной строке выполните `rdesk.exe net-check`. Программа проверит доступ к ретранслятору и пробное подключение по ID.
 
+## Внешний вид
+
+Тема выбирается в правом верхнем углу окна: «как в Windows», светлая или тёмная. Выбор запоминается. Заголовки окна программы и окна сеанса тоже следуют выбранной теме. Цвет кнопок берётся из акцентного цвета Windows.
+
 ## В сеансе
 
 | Действие | Как |
@@ -73,7 +77,9 @@
 
 ## Сборка
 
-Нужны Rust и Visual Studio с компонентами C++ и Windows SDK.
+Нужны Rust и Visual Studio с компонентами C++ и Windows SDK. Интерфейс сделан на [Slint](https://slint.dev) (стиль Fluent), описан в `ui/app.slint`.
+
+[![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-light.svg)](https://slint.dev)
 
 ```bash
 cargo build --release

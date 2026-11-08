@@ -141,6 +141,7 @@ pub fn create(
             None,
         )?;
         HWND_VALUE.store(hwnd.0 as isize, Ordering::Relaxed);
+        crate::system::apply_title_theme(hwnd);
         DragAcceptFiles(hwnd, true);
         if clipboard {
             let _ = AddClipboardFormatListener(hwnd);

@@ -1,0 +1,433 @@
+// The launcher window. All logic lives in src/gui.rs; this file is layout only.
+
+import { Button, LineEdit, ComboBox, Switch, ListView, Palette } from "std-widgets.slint";
+
+export struct Device {
+    name: string,
+    detail: string,
+}
+
+component Card inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    background: Palette.alternate-background;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Palette.border;
+    VerticalLayout {
+        padding: 18px;
+        spacing: 12px;
+        VerticalLayout {
+            spacing: 2px;
+            Text {
+                text: root.title;
+                font-size: 17px;
+                font-weight: 600;
+                color: Palette.alternate-foreground;
+            }
+            if root.subtitle != "": Text {
+                text: root.subtitle;
+                font-size: 12px;
+                color: Palette.alternate-foreground.with-alpha(0.65);
+                wrap: word-wrap;
+            }
+        }
+        @children
+    }
+}
+
+component Caption inherits Text {
+    font-size: 12px;
+    color: Palette.alternate-foreground.with-alpha(0.7);
+}
+
+component Note inherits Text {
+    font-size: 12px;
+    wrap: word-wrap;
+    color: Palette.alternate-foreground.with-alpha(0.85);
+}
+
+component StatusChip inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    height: 28px;
+    border-radius: 14px;
+    background: root.active ? #16a34a.with-alpha(0.16) : Palette.control-background;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 14px;
+        spacing: 8px;
+        alignment: start;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: root.active ? #16a34a : Palette.alternate-foreground.with-alpha(0.4);
+            }
+        }
+        Text {
+            text: root.text;
+            vertical-alignment: center;
+            font-size: 13px;
+            color: root.active ? #16a34a : Palette.alternate-foreground;
+        }
+    }
+}
+
+component DeviceRow inherits Rectangle {
+    in property <Device> device;
+    in property <bool> selected;
+    in property <string> action;
+    callback clicked();
+    callback action-clicked();
+    height: 48px;
+    border-radius: 8px;
+    background: root.selected ? Palette.accent-background.with-alpha(0.18) : touch.has-hover ? Palette.control-background : transparent;
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 8px;
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            Text {
+                text: root.device.name;
+                font-size: 14px;
+                color: Palette.alternate-foreground;
+                overflow: elide;
+            }
+            Text {
+                text: root.device.detail;
+                font-size: 11px;
+                color: Palette.alternate-foreground.with-alpha(0.6);
+            }
+        }
+        if root.action != "": VerticalLayout {
+            alignment: center;
+            Button {
+                text: root.action;
+                clicked => { root.action-clicked(); }
+            }
+        }
+    }
+}
+
+component EmptyHint inherits Rectangle {
+    in property <string> text;
+    height: 56px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Palette.border;
+    Text {
+        text: root.text;
+        font-size: 12px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        color: Palette.alternate-foreground.with-alpha(0.6);
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "rdesk";
+    icon: @image-url("../assets/rdesk.png");
+    preferred-width: 900px;
+    preferred-height: 720px;
+    min-width: 760px;
+    min-height: 600px;
+    background: Palette.background;
+
+    // 0 = like Windows, 1 = light, 2 = dark.
+    in-out property <int> theme-index: 0;
+    property <ColorScheme> system-scheme: ColorScheme.light;
+
+    in property <string> host-status;
+    in property <bool> hosting;
+    in property <bool> host-active;
+    in property <string> host-toggle-text: "Разрешить подключения";
+    in property <bool> host-toggle-enabled: true;
+    in property <string> my-id;
+    in property <bool> pin-set;
+    in-out property <string> host-pin-input;
+    in property <string> pair-text: "Добавить устройство";
+    in property <string> code;
+    in property <string> host-note;
+    in property <[Device]> clients;
+    in-out property <bool> autostart;
+
+    in property <[Device]> hosts;
+    in-out property <int> selected-host: -1;
+    in-out property <string> pin-input;
+    in-out property <int> quality-index: 1;
+    in-out property <bool> clipboard;
+    in-out property <string> new-id;
+    in-out property <string> new-name;
+    in-out property <string> new-code;
+    in property <bool> adding;
+    in property <string> client-status;
+
+    callback toggle-host();
+    callback set-pin();
+    callback copy-id();
+    callback toggle-pairing();
+    callback revoke(int);
+    callback autostart-changed(bool);
+    callback connect();
+    callback forget(int);
+    callback clipboard-changed(bool);
+    callback add-host();
+    callback theme-changed(int);
+
+    public function apply-theme() {
+        Palette.color-scheme = root.theme-index == 1 ? ColorScheme.light
+            : root.theme-index == 2 ? ColorScheme.dark
+            : root.system-scheme;
+    }
+
+    init => {
+        root.system-scheme = Palette.color-scheme;
+        root.apply-theme();
+    }
+
+    VerticalLayout {
+        padding: 20px;
+        spacing: 16px;
+
+        HorizontalLayout {
+            spacing: 12px;
+            Image {
+                source: @image-url("../assets/rdesk.png");
+                width: 32px;
+                height: 32px;
+            }
+            VerticalLayout {
+                alignment: center;
+                Text {
+                    text: "rdesk";
+                    font-size: 22px;
+                    font-weight: 700;
+                    color: Palette.foreground;
+                }
+                Text {
+                    text: "Удалённый рабочий стол по ID";
+                    font-size: 12px;
+                    color: Palette.foreground.with-alpha(0.65);
+                }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            VerticalLayout {
+                alignment: center;
+                ComboBox {
+                    width: 190px;
+                    model: ["Тема как в Windows", "Светлая тема", "Тёмная тема"];
+                    current-index: root.theme-index;
+                    selected => {
+                        root.theme-index = self.current-index;
+                        root.apply-theme();
+                        root.theme-changed(self.current-index);
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 16px;
+            vertical-stretch: 1;
+
+            // Left column: this PC.
+            Card {
+                title: "Этот компьютер";
+                subtitle: "Разрешите подключения, чтобы управлять им с другого устройства.";
+                horizontal-stretch: 1;
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    StatusChip {
+                        text: root.host-status;
+                        active: root.host-active;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: root.host-toggle-text;
+                        primary: !root.hosting;
+                        enabled: root.host-toggle-enabled;
+                        clicked => { root.toggle-host(); }
+                    }
+                }
+
+                Caption { text: "ID этого ПК — сообщите его, чтобы подключаться сюда"; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit {
+                        text: root.my-id;
+                        read-only: true;
+                        font-size: 12px;
+                    }
+                    Button {
+                        text: "Копировать";
+                        clicked => { root.copy-id(); }
+                    }
+                }
+
+                Caption { text: root.pin-set ? "PIN для входа задан" : "Задайте PIN — без него подключения отклоняются"; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit {
+                        placeholder-text: "Новый PIN (от 6 символов)";
+                        input-type: password;
+                        text <=> root.host-pin-input;
+                        accepted => { root.set-pin(); }
+                    }
+                    Button {
+                        text: root.pin-set ? "Сменить PIN" : "Задать PIN";
+                        clicked => { root.set-pin(); }
+                    }
+                }
+
+                Button {
+                    text: root.pair-text;
+                    clicked => { root.toggle-pairing(); }
+                }
+                if root.code != "": Rectangle {
+                    height: 64px;
+                    border-radius: 10px;
+                    background: Palette.accent-background.with-alpha(0.14);
+                    Text {
+                        text: root.code;
+                        font-size: 32px;
+                        font-weight: 700;
+                        letter-spacing: 3px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        color: Palette.accent-background;
+                    }
+                }
+                if root.host-note != "": Note { text: root.host-note; }
+
+                Caption { text: "Устройства с доступом сюда"; }
+                if root.clients.length == 0: EmptyHint { text: "Пока нет добавленных устройств"; }
+                if root.clients.length > 0: ListView {
+                    min-height: 96px;
+                    vertical-stretch: 1;
+                    for device[index] in root.clients: DeviceRow {
+                        device: device;
+                        action: "Отозвать";
+                        action-clicked => { root.revoke(index); }
+                    }
+                }
+                if root.clients.length == 0: Rectangle { vertical-stretch: 1; }
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        Note { text: "Запускать при входе в Windows и принимать подключения"; }
+                    }
+                    Switch {
+                        checked <=> root.autostart;
+                        toggled => { root.autostart-changed(self.checked); }
+                    }
+                }
+            }
+
+            // Right column: other PCs.
+            VerticalLayout {
+                spacing: 16px;
+                horizontal-stretch: 1;
+
+                Card {
+                    title: "Мои компьютеры";
+                    vertical-stretch: 1;
+
+                    if root.hosts.length == 0: EmptyHint { text: "Добавьте компьютер ниже по его ID и коду"; }
+                    if root.hosts.length > 0: ListView {
+                        min-height: 96px;
+                        vertical-stretch: 1;
+                        for device[index] in root.hosts: DeviceRow {
+                            device: device;
+                            selected: index == root.selected-host;
+                            action: index == root.selected-host ? "Удалить" : "";
+                            clicked => { root.selected-host = index; }
+                            action-clicked => { root.forget(index); }
+                        }
+                    }
+                    if root.hosts.length == 0: Rectangle { vertical-stretch: 1; }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        LineEdit {
+                            placeholder-text: "PIN удалённого ПК";
+                            input-type: password;
+                            text <=> root.pin-input;
+                            accepted => { root.connect(); }
+                        }
+                        ComboBox {
+                            width: 200px;
+                            model: ["Экономно · 8 Мбит/с", "Обычно · 20 Мбит/с", "Максимум · 40 Мбит/с"];
+                            current-index <=> root.quality-index;
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Note { text: "Общий буфер обмена с этим компьютером"; }
+                        }
+                        Switch {
+                            checked <=> root.clipboard;
+                            toggled => { root.clipboard-changed(self.checked); }
+                        }
+                    }
+                    Button {
+                        text: "Подключиться";
+                        primary: true;
+                        enabled: root.selected-host >= 0;
+                        clicked => { root.connect(); }
+                    }
+                }
+
+                Card {
+                    title: "Добавить компьютер";
+                    subtitle: "На том ПК нажмите «Добавить устройство» и введите показанный код.";
+
+                    LineEdit {
+                        placeholder-text: "ID удалённого ПК";
+                        text <=> root.new-id;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        LineEdit {
+                            placeholder-text: "Название";
+                            text <=> root.new-name;
+                        }
+                        LineEdit {
+                            width: 150px;
+                            placeholder-text: "Код";
+                            text <=> root.new-code;
+                            accepted => { root.add-host(); }
+                        }
+                    }
+                    Button {
+                        text: root.adding ? "Подключаюсь…" : "Добавить";
+                        enabled: !root.adding;
+                        clicked => { root.add-host(); }
+                    }
+                    if root.client-status != "": Note { text: root.client-status; }
+                }
+            }
+        }
+
+        Text {
+            text: "В сеансе: Ctrl+Alt+Shift+F — полный экран, +M — следующий монитор, +Q — выход. Файл можно перетащить в окно сеанса.";
+            font-size: 11px;
+            wrap: word-wrap;
+            color: Palette.foreground.with-alpha(0.55);
+        }
+    }
+}

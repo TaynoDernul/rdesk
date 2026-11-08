@@ -7,7 +7,8 @@ use std::process::{Command, Stdio};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HWND};
 use windows::Win32::System::Registry::{
-    RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
+    RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_DWORD,
+    RRF_RT_REG_SZ,
 };
 use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
@@ -155,6 +156,70 @@ fn delete_value(subkey: &str, name: &str) -> Result<()> {
         bail!("registry delete failed: {status:?}");
     }
     Ok(())
+}
+
+fn ui_settings_path() -> Result<std::path::PathBuf> {
+    Ok(crate::identity::config_dir()?.join("ui.json"))
+}
+
+/// 0 = like Windows, 1 = light, 2 = dark. A missing or odd file means 0.
+pub fn theme_setting() -> u8 {
+    let read = || -> Option<u8> {
+        let text = std::fs::read_to_string(ui_settings_path().ok()?).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        value.get("theme")?.as_u64().filter(|t| *t <= 2).map(|t| t as u8)
+    };
+    read().unwrap_or(0)
+}
+
+pub fn save_theme_setting(theme: u8) -> Result<()> {
+    let body = serde_json::json!({ "theme": theme.min(2) });
+    std::fs::write(ui_settings_path()?, serde_json::to_vec_pretty(&body)?)?;
+    Ok(())
+}
+
+fn read_dword(subkey: &str, name: &str) -> Option<u32> {
+    let (subkey, name) = (wide(subkey), wide(name));
+    let mut value = 0u32;
+    let mut size = 4u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut _),
+            Some(&mut size),
+        )
+    };
+    (status == ERROR_SUCCESS).then_some(value)
+}
+
+/// The chosen theme, or the Windows app theme when following the system.
+pub fn prefers_dark() -> bool {
+    match theme_setting() {
+        1 => false,
+        2 => true,
+        _ => read_dword(
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            "AppsUseLightTheme",
+        ) == Some(0),
+    }
+}
+
+/// Gives a Win32 window a title bar that matches the theme.
+pub fn apply_title_theme(hwnd: HWND) {
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+    let dark = windows::Win32::Foundation::BOOL::from(prefers_dark());
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark as *const _ as *const _,
+            std::mem::size_of_val(&dark) as u32,
+        )
+    };
 }
 
 fn current_exe_string() -> Result<String> {
