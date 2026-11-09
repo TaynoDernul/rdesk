@@ -158,7 +158,7 @@ pub fn run(runtime: tokio::runtime::Runtime, id: Identity, options: Options) -> 
         println!("{text}");
         *NOTICE.lock().expect("notice lock") = text;
     });
-    runtime.spawn(files::receive_all(conn.clone(), progress.clone(), notify));
+    runtime.spawn(files::receive_all(conn.clone(), progress.clone(), notify, options.clipboard));
     runtime.spawn(report_stats(conn.clone(), stats.clone(), host.name.clone(), options.stats, progress));
     if let Some(seconds) = options.duration {
         runtime.spawn(async move {

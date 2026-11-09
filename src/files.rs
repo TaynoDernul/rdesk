@@ -228,12 +228,18 @@ struct Batch {
 
 /// Receives everything the other side sends, until the connection closes.
 /// `notify` gets a line for the person at this PC after each completed batch.
-pub async fn receive_all(conn: Connection, progress: Arc<Progress>, notify: Arc<dyn Fn(String) + Send + Sync>) {
+/// Without `clipboard`, pictures and files meant for the clipboard are refused.
+pub async fn receive_all(
+    conn: Connection,
+    progress: Arc<Progress>,
+    notify: Arc<dyn Fn(String) + Send + Sync>,
+    clipboard: bool,
+) {
     let batches: Arc<Mutex<HashMap<u64, Batch>>> = Arc::default();
     while let Ok(mut stream) = conn.accept_uni().await {
         let (batches, progress, notify) = (batches.clone(), progress.clone(), notify.clone());
         tokio::spawn(async move {
-            if let Err(e) = receive_one(&mut stream, &batches, &progress, notify.as_ref()).await {
+            if let Err(e) = receive_one(&mut stream, &batches, &progress, notify.as_ref(), clipboard).await {
                 crate::log_event(&format!("transfer failed: {e:#}"));
                 notify(format!("Передача не удалась: {e:#}"));
             }
@@ -246,8 +252,15 @@ async fn receive_one(
     batches: &Mutex<HashMap<u64, Batch>>,
     progress: &Progress,
     notify: &(dyn Fn(String) + Send + Sync),
+    allow_clipboard: bool,
 ) -> Result<()> {
-    match read_msg::<_, StreamHeader>(stream).await? {
+    let header = read_msg::<_, StreamHeader>(stream).await?;
+    let for_clipboard = matches!(header, StreamHeader::ClipboardImage { .. } | StreamHeader::File { clipboard: true, .. });
+    if for_clipboard && !allow_clipboard {
+        let _ = stream.stop(1u32.into());
+        bail!("clipboard transfer refused");
+    }
+    match header {
         StreamHeader::ClipboardImage { size } => {
             if size > MAX_IMAGE {
                 bail!("picture is too large");

@@ -489,7 +489,7 @@ mod tests {
         let progress = Arc::new(crate::files::Progress::default());
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         let notify: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |t| { let _ = tx.send(t); });
-        tokio::spawn(crate::files::receive_all(server.clone(), progress.clone(), notify));
+        tokio::spawn(crate::files::receive_all(server.clone(), progress.clone(), notify, false));
         let sent = crate::files::send_paths(&conn, &[source], false, &progress).await.unwrap();
         assert_eq!(sent, (1, payload.len() as u64));
         let note = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();

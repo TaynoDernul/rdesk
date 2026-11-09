@@ -243,7 +243,7 @@ async fn session(conn: Connection, stats: bool) -> Result<()> {
 
     let sound = Mutex::new(audio_on.then(|| audio::Capture::start(conn.clone())));
     let notify: Arc<dyn Fn(String) + Send + Sync> = Arc::new(set_note);
-    let files = tokio::spawn(files::receive_all(conn.clone(), progress.clone(), notify));
+    let files = tokio::spawn(files::receive_all(conn.clone(), progress.clone(), notify, clipboard_on && !view_only));
     let clip = tokio::spawn(forward_clipboard(clip_rx, conn.clone(), ctl_tx.clone(), progress.clone()));
     let context = Session {
         conn: conn.clone(),
@@ -407,10 +407,13 @@ async fn input_loop(
             Err(_) => return Ok(()),
         };
         match msg {
+            // Watching only: nothing from the other side may act on this PC.
             ClientMsg::MouseMove { .. }
             | ClientMsg::MouseButton { .. }
             | ClientMsg::Wheel { .. }
             | ClientMsg::Key { .. }
+            | ClientMsg::Clipboard { .. }
+            | ClientMsg::RequestFiles { .. }
                 if session.view_only => {}
             ClientMsg::MouseMove { x, y } => {
                 let monitor = *shared.rect.lock().expect("rect lock");

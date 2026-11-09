@@ -167,6 +167,14 @@ mod tests {
         assert!(!is_newer("", "0.1.0"));
     }
 
+    /// Asks the real GitHub; run by hand: cargo test github_answers -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn github_answers_the_version_question() {
+        let found = check().await.expect("GitHub answered");
+        println!("newer release: {:?}", found.map(|f| f.version));
+    }
+
     #[test]
     fn hashes_are_lowercase_hex() {
         assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");

@@ -58,6 +58,10 @@ fn line(who: &str, text: &str) -> String {
 /// Creates the hidden chat window. `send` is called with each typed message.
 pub fn start(title: &str, send: Sender) {
     if !window().0.is_null() {
+        // The last session's window has not closed yet: it serves this one.
+        if let Some(state) = STATE.lock().expect("chat lock").as_mut() {
+            state.send = send;
+        }
         return;
     }
     let title = wide(title);
