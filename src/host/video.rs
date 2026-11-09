@@ -4,7 +4,7 @@
 
 use super::encoder::Encoder;
 use crate::d3d;
-use crate::fec::{Packetizer, FLAG_KEY};
+use crate::fec::{Packetizer, FLAG_HEVC, FLAG_KEY};
 use crate::proto::{CursorShape, HostMsg};
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -274,6 +274,8 @@ pub struct VideoShared {
     /// Rate chosen so far, kept across pipeline restarts (0 = not chosen yet).
     pub current_kbps: AtomicU32,
     pub current_fps: AtomicU32,
+    /// The client can decode H.265. Cleared if this PC cannot encode it.
+    pub hevc: AtomicBool,
 }
 
 pub fn run(conn: Connection, shared: &VideoShared, ctl: UnboundedSender<HostMsg>) {
@@ -401,10 +403,20 @@ fn pipeline(
         chosen => chosen,
     };
     let mut rate = RateControl::new(max_kbps, shared.fps, kbps, fps, Instant::now());
-    let mut encoder =
-        Encoder::new(&device, adapter_desc.AdapterLuid, width, height, shared.fps, kbps)
-            .context("cannot start hardware H.264 encoder")?;
-    crate::log_event(&format!("encoder: {} {width}x{height}@{} {kbps} kbps", encoder.name, shared.fps));
+    let luid = adapter_desc.AdapterLuid;
+    let mut encoder = match Encoder::new(&device, luid, width, height, shared.fps, kbps, shared.hevc.load(Ordering::Relaxed)) {
+        Ok(encoder) => encoder,
+        Err(e) if shared.hevc.load(Ordering::Relaxed) => {
+            // No H.265 on this graphics card: H.264 works everywhere.
+            crate::log_event(&format!("no HEVC encoder, using H.264: {e:#}"));
+            shared.hevc.store(false, Ordering::Relaxed);
+            Encoder::new(&device, luid, width, height, shared.fps, kbps, false)
+                .context("cannot start hardware H.264 encoder")?
+        }
+        Err(e) => return Err(e.context("cannot start hardware H.264 encoder")),
+    };
+    let codec = if encoder.hevc { "H.265" } else { "H.264" };
+    crate::log_event(&format!("encoder: {} {codec} {width}x{height}@{} {kbps} kbps", encoder.name, shared.fps));
     println!("Кодировщик: {}, {width}x{height}@{}", encoder.name, shared.fps);
 
     let _ = ctl.send(HostMsg::VideoInfo {
@@ -452,7 +464,7 @@ fn pipeline(
             rate.record_sent(data.len());
             let max = conn.max_datagram_size().ok_or_else(|| anyhow!("peer refuses datagrams"))?;
             let id = shared.frame_id.fetch_add(1, Ordering::Relaxed) as u32;
-            let flags = if encoder_key { FLAG_KEY } else { 0 };
+            let flags = if encoder_key { FLAG_KEY } else { 0 } | if encoder.hevc { FLAG_HEVC } else { 0 };
             packetizer.packetize(&data, id, flags, capture_us, max, |shard| pacer.push(Bytes::from(shard)))?;
         }
         match pacer.flush(Instant::now(), rate.pace_kbps(), |d| conn.send_datagram(d)) {

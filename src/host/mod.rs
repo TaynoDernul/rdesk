@@ -164,7 +164,7 @@ async fn session(conn: Connection, stats: bool) -> Result<()> {
         .await
         .context("client did not open the control stream")??;
     let hello: ClientMsg = read_msg(&mut recv).await?;
-    let ClientMsg::Hello { max_bitrate_kbps, fps, clipboard: clipboard_on, audio: audio_on, pin } = hello else {
+    let ClientMsg::Hello { max_bitrate_kbps, fps, clipboard: clipboard_on, audio: audio_on, hevc, pin } = hello else {
         bail!("expected Hello");
     };
 
@@ -206,6 +206,7 @@ async fn session(conn: Connection, stats: bool) -> Result<()> {
         bail!("cannot show the session banner");
     }
     let _session = SessionGuard::new(&peer, &conn);
+    let _ = ctl_tx.send(HostMsg::WakeInfo { macs: crate::system::local_macs() });
     if view_only {
         let _ = ctl_tx.send(HostMsg::Notice { text: "разрешён только просмотр".to_string() });
     }
@@ -231,6 +232,7 @@ async fn session(conn: Connection, stats: bool) -> Result<()> {
         frame_id: AtomicU64::new(0),
         current_kbps: AtomicU32::new(0),
         current_fps: AtomicU32::new(0),
+        hevc: AtomicBool::new(hevc),
     });
     let video_thread = {
         let (conn, shared, ctl) = (conn.clone(), shared.clone(), ctl_tx.clone());

@@ -31,6 +31,8 @@ pub struct Options {
     pub fps: u32,
     pub clipboard: bool,
     pub audio: bool,
+    /// Offer H.265 when this PC can decode it.
+    pub hevc: bool,
     pub stats: bool,
     pub duration: Option<u64>,
     /// Started from the window, so there is no console to report to.
@@ -209,6 +211,24 @@ pub fn run(runtime: tokio::runtime::Runtime, id: Identity, options: Options) -> 
     Ok(())
 }
 
+/// Whether H.265 can be decoded here, checked on a thread of its own because
+/// it needs COM and Media Foundation.
+fn hevc_ok() -> bool {
+    std::thread::spawn(|| unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        let _ = windows::Win32::Media::MediaFoundation::MFStartup(
+            windows::Win32::Media::MediaFoundation::MF_VERSION,
+            windows::Win32::Media::MediaFoundation::MFSTARTUP_FULL,
+        );
+        let ok = decoder::hevc_supported();
+        let _ = windows::Win32::Media::MediaFoundation::MFShutdown();
+        windows::Win32::System::Com::CoUninitialize();
+        ok
+    })
+    .join()
+    .unwrap_or(false)
+}
+
 /// Sends the PIN and waits for the host's answer. A refusal arrives as the
 /// connection closing with a reason, which becomes the error text.
 async fn authenticate(
@@ -229,6 +249,7 @@ async fn authenticate(
             fps: options.fps,
             clipboard: options.clipboard,
             audio: options.audio,
+            hevc: options.hevc && hevc_ok(),
             pin,
         },
     )
@@ -286,9 +307,28 @@ async fn start_control(
                     *NOTICE.lock().expect("notice lock") = text;
                 }
                 HostMsg::Chat { text } => crate::chat::incoming(&host_name, &text),
+                HostMsg::WakeInfo { macs } => {
+                    if let Err(e) = remember_macs(&host_name, macs) {
+                        log_event(&format!("wake addresses not saved: {e:#}"));
+                    }
+                }
             }
         }
     });
+}
+
+/// Keeps the host's adapter addresses in the signed list, for waking it.
+fn remember_macs(host_name: &str, macs: Vec<[u8; 6]>) -> Result<()> {
+    if macs.is_empty() {
+        return Ok(());
+    }
+    let mut trust = Trust::load()?;
+    let Some(host) = trust.hosts.iter_mut().find(|h| h.name == host_name) else { return Ok(()) };
+    if host.macs == macs {
+        return Ok(());
+    }
+    host.macs = macs;
+    trust.save()
 }
 
 async fn receive_video(

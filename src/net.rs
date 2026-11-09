@@ -13,7 +13,8 @@ use anyhow::{anyhow, Result};
 use iroh::endpoint::{
     presets, AfterHandshakeOutcome, Connection, EndpointHooks, QuicTransportConfig, Side, VarInt,
 };
-use iroh::{Endpoint, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointId, RelayMode, RelayUrl, SecretKey};
+use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +36,63 @@ const CODE_UNAVAILABLE: u32 = 3;
 const NOT_PAIRED: &str = "это устройство не добавлено на удалённом ПК";
 const PAIRING_CLOSED: &str = "на удалённом ПК не запущено добавление устройства";
 const NOT_LISTENING: &str = "на удалённом ПК не включены подключения";
+/// rdesk PCs announce themselves on the local network under this name, so
+/// they are found there without the internet and listed for adding.
+const MDNS_SERVICE: &str = "rdesk";
+
+/// Checks a relay address typed in the settings. Empty means n0's relays.
+pub fn parse_relay(text: &str) -> Result<Option<RelayUrl>> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    if !text.starts_with("https://") && !text.starts_with("http://") {
+        return Err(anyhow!("адрес ретранслятора должен начинаться с https://"));
+    }
+    text.parse().map(Some).map_err(|_| anyhow!("неверный адрес ретранслятора"))
+}
+
+/// The user's own relay server from the settings, if one is set.
+pub fn custom_relay() -> Option<RelayUrl> {
+    let text = crate::system::ui_setting("relay")?;
+    parse_relay(text.as_str()?).ok().flatten()
+}
+
+/// Internet endpoints: n0's discovery, the chosen relay, and the local network.
+fn internet_builder(advertise: bool) -> iroh::endpoint::Builder {
+    let mut builder = Endpoint::builder(presets::N0)
+        .address_lookup(MdnsAddressLookup::builder().service_name(MDNS_SERVICE).advertise(advertise));
+    if let Some(url) = custom_relay() {
+        builder = builder.relay_mode(RelayMode::custom([url]));
+    }
+    builder
+}
+
+/// IDs of rdesk PCs that accept connections on this local network.
+pub async fn scan_local(wait: Duration) -> Result<Vec<String>> {
+    use n0_future::StreamExt;
+    let mut seed = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut seed)
+        .map_err(|_| anyhow!("system RNG failed"))?;
+    let me = SecretKey::from_bytes(&seed).public();
+    let mdns = MdnsAddressLookup::builder()
+        .service_name(MDNS_SERVICE)
+        .advertise(false)
+        .build(me)
+        .map_err(|e| anyhow!("поиск в сети недоступен: {e}"))?;
+    let mut events = mdns.subscribe().await;
+    let mut found = Vec::new();
+    let deadline = tokio::time::Instant::now() + wait;
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.next()).await {
+        if let DiscoveryEvent::Discovered { endpoint_info, .. } = event {
+            let id = endpoint_info.endpoint_id.to_string();
+            if !found.contains(&id) {
+                found.push(id);
+            }
+        }
+    }
+    Ok(found)
+}
 
 fn transport() -> QuicTransportConfig {
     QuicTransportConfig::builder()
@@ -134,7 +192,7 @@ async fn bind_host(key: SecretKey, pairing_open: Arc<AtomicBool>, local_only: bo
     let builder = if local_only {
         Endpoint::builder(presets::Minimal).relay_mode(iroh::RelayMode::Disabled)
     } else {
-        Endpoint::builder(presets::N0)
+        internet_builder(true)
     };
     builder
         .secret_key(key)
@@ -210,8 +268,7 @@ impl HostNode {
 
 /// An endpoint for connecting out with this PC's client key.
 pub async fn client_endpoint(key: &SecretKey) -> Result<Endpoint> {
-    let mut builder =
-        Endpoint::builder(presets::N0).secret_key(key.clone()).transport_config(transport());
+    let mut builder = internet_builder(false).secret_key(key.clone()).transport_config(transport());
     if std::env::var_os(RELAY_ONLY_ENV).is_some() {
         builder = builder.clear_ip_transports();
     }
@@ -496,6 +553,78 @@ mod tests {
         let gate = Gate { pairing_open: Arc::new(AtomicBool::new(false)) };
         assert!(matches!(gate.decide(false, ALPN_SESSION, "x"), AfterHandshakeOutcome::Accept));
         assert!(matches!(gate.decide(true, b"other", "x"), AfterHandshakeOutcome::Reject { .. }));
+    }
+
+    /// A PC announcing itself on the local network shows up in a scan,
+    /// with no relay or internet involved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_scan_finds_an_announcing_pc() {
+        let host = Endpoint::builder(presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .secret_key(key(9))
+            .address_lookup(MdnsAddressLookup::builder().service_name(MDNS_SERVICE))
+            .bind()
+            .await
+            .unwrap();
+        let found = scan_local(Duration::from_secs(5)).await.unwrap();
+        assert!(found.contains(&host.id().to_string()), "found {found:?}");
+        host.close().await;
+    }
+
+    /// Needs a relay server: RDESK_TEST_RELAY=http://127.0.0.1:3341/?token=...
+    /// cargo test custom_relay -- --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn custom_relay_carries_a_connection() {
+        const ALPN: &[u8] = b"rdesk-test/1";
+        let relay = parse_relay(&std::env::var("RDESK_TEST_RELAY").unwrap()).unwrap().unwrap();
+        let host = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::custom([relay.clone()]))
+            .secret_key(key(11))
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), host.online()).await.expect("host reached the relay");
+        let accepting = {
+            let host = host.clone();
+            tokio::spawn(async move { host.accept().await.unwrap().accept().unwrap().await.unwrap() })
+        };
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::custom([relay.clone()]))
+            .clear_ip_transports()
+            .secret_key(key(12))
+            .bind()
+            .await
+            .unwrap();
+        let conn = client.connect(EndpointAddr::new(host.id()).with_relay_url(relay), ALPN).await.unwrap();
+        let _server = accepting.await.unwrap();
+        assert_eq!(route_info(&conn).map(|(_, relayed)| relayed), Some(true));
+    }
+
+    /// The host endpoint as the program builds it reaches the relay from the
+    /// settings. Needs RDESK_TEST_RELAY like the test above.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn host_uses_the_relay_from_settings() {
+        let _guard = SERIAL.lock().unwrap();
+        let dir = profile("relay-setting");
+        let url = std::env::var("RDESK_TEST_RELAY").unwrap();
+        std::fs::create_dir_all(dir.join("rdesk")).unwrap();
+        crate::system::save_ui_setting("relay", serde_json::json!(url)).unwrap();
+        assert!(custom_relay().is_some());
+        let host = bind_host(key(13), Arc::new(AtomicBool::new(false)), false).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(15), host.online()).await.expect("host reached the relay");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn relay_addresses_are_checked() {
+        assert_eq!(parse_relay("  ").unwrap(), None);
+        let url = parse_relay("https://relay.example.com").unwrap().unwrap();
+        assert!(url.to_string().starts_with("https://relay.example.com"));
+        assert!(parse_relay("relay.example.com").is_err());
+        assert!(parse_relay("https://").is_err());
     }
 
     #[test]

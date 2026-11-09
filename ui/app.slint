@@ -5,6 +5,7 @@ import { Button, LineEdit, ComboBox, Switch, ListView, Palette } from "std-widge
 export struct Device {
     name: string,
     detail: string,
+    wakeable: bool,
 }
 
 export struct LogEntry {
@@ -166,6 +167,16 @@ export component AppWindow inherits Window {
     in-out property <bool> confirm;
     in property <[LogEntry]> log-entries;
     in-out property <bool> show-log;
+    in-out property <bool> show-relay;
+    in-out property <string> relay-url;
+    in property <string> relay-status;
+    in property <[Device]> lan-hosts;
+    in property <bool> scanning;
+    in property <string> version;
+    in-out property <bool> auto-update;
+    in property <string> update-status;
+    in property <string> update-version;
+    in property <bool> updating;
 
     in property <[Device]> hosts;
     in-out property <int> selected-host: -1;
@@ -187,6 +198,14 @@ export component AppWindow inherits Window {
     callback autostart-changed(bool);
     callback confirm-changed(bool);
     callback open-log();
+    callback open-relay();
+    callback save-relay();
+    callback check-update();
+    callback install-update();
+    callback auto-update-changed(bool);
+    callback wake();
+    callback scan-lan();
+    callback pick-lan(int);
     callback connect();
     callback forget(int);
     callback clipboard-changed(bool);
@@ -236,6 +255,13 @@ export component AppWindow inherits Window {
                 Button {
                     text: "Журнал подключений";
                     clicked => { root.open-log(); }
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                Button {
+                    text: root.update-version != "" ? "Настройки •" : "Настройки";
+                    clicked => { root.open-relay(); }
                 }
             }
             VerticalLayout {
@@ -427,11 +453,19 @@ export component AppWindow inherits Window {
                             toggled => { root.audio-changed(self.checked); }
                         }
                     }
-                    Button {
-                        text: "Подключиться";
-                        primary: true;
-                        enabled: root.selected-host >= 0;
-                        clicked => { root.connect(); }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        if root.selected-host >= 0 && root.hosts[root.selected-host].wakeable: Button {
+                            text: "Разбудить";
+                            clicked => { root.wake(); }
+                        }
+                        Button {
+                            text: "Подключиться";
+                            primary: true;
+                            horizontal-stretch: 1;
+                            enabled: root.selected-host >= 0;
+                            clicked => { root.connect(); }
+                        }
                     }
                 }
 
@@ -439,6 +473,21 @@ export component AppWindow inherits Window {
                     title: "Добавить компьютер";
                     subtitle: "На том ПК нажмите «Добавить устройство» и введите показанный код.";
 
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Button {
+                            text: root.scanning ? "Ищу в локальной сети…" : "Найти в локальной сети";
+                            enabled: !root.scanning;
+                            clicked => { root.scan-lan(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    for device[index] in root.lan-hosts: DeviceRow {
+                        device: device;
+                        action: "Выбрать";
+                        clicked => { root.pick-lan(index); }
+                        action-clicked => { root.pick-lan(index); }
+                    }
                     LineEdit {
                         placeholder-text: "ID удалённого ПК";
                         text <=> root.new-id;
@@ -471,6 +520,78 @@ export component AppWindow inherits Window {
             font-size: 11px;
             wrap: word-wrap;
             color: Palette.foreground.with-alpha(0.55);
+        }
+    }
+
+    // The user's own relay server.
+    if root.show-relay: Rectangle {
+        background: Palette.background.with-alpha(0.7);
+        TouchArea { clicked => { root.show-relay = false; } }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(600px, parent.width - 40px);
+            height: min(560px, parent.height - 40px);
+            TouchArea { }
+            Card {
+                width: parent.width;
+                height: parent.height;
+                title: "Настройки";
+                Caption { text: "Свой ретранслятор"; }
+                Note {
+                    text: "Если у вас есть VPS, на нём можно запустить iroh-relay, и связь через ретранслятор пойдёт через ваш сервер, а не через бесплатные серверы n0. Укажите одинаковый адрес на обоих ПК. Пустое поле: серверы n0. Как настроить сервер, написано в README.";
+                }
+                LineEdit {
+                    placeholder-text: "https://relay.example.com/?token=...";
+                    text <=> root.relay-url;
+                    accepted => { root.save-relay(); }
+                }
+                if root.relay-status != "": Note { text: root.relay-status; }
+
+                Caption { text: "Обновления · установлена версия " + root.version; }
+                HorizontalLayout {
+                    spacing: 10px;
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        Note { text: "Проверять обновления на GitHub при запуске"; }
+                    }
+                    Switch {
+                        checked <=> root.auto-update;
+                        toggled => { root.auto-update-changed(self.checked); }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Button {
+                        text: "Проверить сейчас";
+                        enabled: !root.updating;
+                        clicked => { root.check-update(); }
+                    }
+                    if root.update-version != "": Button {
+                        text: "Установить версию " + root.update-version;
+                        primary: true;
+                        enabled: !root.updating;
+                        clicked => { root.install-update(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                if root.update-status != "": Note { text: root.update-status; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    Button {
+                        text: "Закрыть";
+                        clicked => { root.show-relay = false; }
+                    }
+                    Button {
+                        text: "Сохранить ретранслятор";
+                        primary: true;
+                        clicked => { root.save-relay(); }
+                    }
+                }
+            }
         }
     }
 

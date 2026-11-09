@@ -148,6 +148,9 @@ pub struct TrustedHost {
     pub name: String,
     /// The host's ID, which is also how it is reached.
     pub id: String,
+    /// Its network adapters, reported during sessions, for waking it up.
+    #[serde(default)]
+    pub macs: Vec<[u8; 6]>,
 }
 
 /// Clients allowed to connect here, hosts this machine can connect to, and the
@@ -272,7 +275,7 @@ impl Trust {
 
     pub fn add_host(&mut self, name: String, id: String) {
         self.hosts.retain(|h| h.name != name && h.id != id);
-        self.hosts.push(TrustedHost { name, id });
+        self.hosts.push(TrustedHost { name, id, macs: Vec::new() });
     }
 
     /// Removes peers whose name matches exactly or whose ID starts with
@@ -474,6 +477,6 @@ mod tests {
         t.add_host("home".into(), "id1".into());
         t.add_host("home".into(), "id2".into());
         t.add_host("work".into(), "id2".into());
-        assert_eq!(t.hosts, vec![TrustedHost { name: "work".into(), id: "id2".into() }]);
+        assert_eq!(t.hosts, vec![TrustedHost { name: "work".into(), id: "id2".into(), macs: Vec::new() }]);
     }
 }

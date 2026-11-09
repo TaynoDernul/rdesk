@@ -207,7 +207,7 @@ pub fn run(hwnd: HWND, fps: u32, frames: Receiver<Frame>, stats: Arc<Stats>) {
 
 fn decode_loop(hwnd: HWND, fps: u32, frames: &Receiver<Frame>, stats: &Stats) -> Result<()> {
     let mut renderer = Renderer::new(hwnd, fps)?;
-    let mut decoder = Decoder::new(&renderer.device)?;
+    let mut decoder = Decoder::new(&renderer.device, false)?;
     let mut stored = false;
     let mut last_size = renderer.size;
 
@@ -228,6 +228,10 @@ fn decode_loop(hwnd: HWND, fps: u32, frames: &Receiver<Frame>, stats: &Stats) ->
         super::QUEUED.fetch_sub(1, Ordering::Relaxed);
         let capture_us = frame.timestamp_us;
         let started = Instant::now();
+        // The host picks the codec; follow it at the keyframe where it changes.
+        if frame.hevc != decoder.hevc {
+            decoder = Decoder::new(&renderer.device, frame.hevc)?;
+        }
         for picture in decoder.decode(&frame.data)? {
             renderer.store(&picture)?;
             stored = true;

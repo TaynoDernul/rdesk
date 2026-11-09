@@ -19,6 +19,7 @@ mod pairing;
 mod pin;
 mod proto;
 mod system;
+mod update;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -82,6 +83,9 @@ enum Command {
         /// Не передавать звук с удалённого ПК
         #[arg(long)]
         no_audio: bool,
+        /// Только H.264, даже если доступен H.265
+        #[arg(long)]
+        h264: bool,
         /// Печатать статистику раз в секунду
         #[arg(long)]
         stats: bool,
@@ -191,7 +195,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::PairWith { id: host_id, name } => {
             runtime.block_on(pairing::run_client(&id, &host_id, &name))
         }
-        Command::Connect { name, bitrate, fps, no_clipboard, no_audio, stats, duration, dialogs } => {
+        Command::Connect { name, bitrate, fps, no_clipboard, no_audio, h264, stats, duration, dialogs } => {
             client::run(
                 runtime,
                 id,
@@ -201,6 +205,7 @@ fn run(cli: Cli) -> Result<()> {
                     fps,
                     clipboard: !no_clipboard,
                     audio: !no_audio,
+                    hevc: !h264,
                     stats,
                     duration,
                     dialogs,

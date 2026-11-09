@@ -1,5 +1,7 @@
-//! Hardware H.264 through an asynchronous Media Foundation transform. AMD,
-//! NVIDIA and Intel drivers all expose their encoders this way.
+//! Hardware H.264 or H.265 (HEVC) through an asynchronous Media Foundation
+//! transform. AMD, NVIDIA and Intel drivers all expose their encoders this way.
+//! HEVC gives a better picture at the same bitrate, which matters most on a
+//! relayed connection, but needs a decoder on the other side.
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::time::Instant;
@@ -12,9 +14,12 @@ use windows::Win32::System::Com::CoTaskMemFree;
 const CLEAN_POINT_FALSE: u32 = 0;
 const RATE_CONTROL_CBR: u32 = 0;
 const H264_PROFILE_HIGH: u32 = 100;
+const HEVC_PROFILE_MAIN: u32 = 1;
 const GOP_FRAMES: u32 = 600;
 const NAL_SPS: u8 = 7;
 const NAL_AUD: u8 = 9;
+const HEVC_NAL_VPS: u8 = 32;
+const HEVC_NAL_AUD: u8 = 35;
 
 pub struct Encoder {
     mft: IMFTransform,
@@ -29,6 +34,7 @@ pub struct Encoder {
     frame_duration: i64,
     need_input: u32,
     pub name: String,
+    pub hevc: bool,
 }
 
 impl Encoder {
@@ -39,10 +45,12 @@ impl Encoder {
         height: u32,
         fps: u32,
         kbps: u32,
+        hevc: bool,
     ) -> Result<Self> {
-        let mut last_error = anyhow!("no hardware H.264 encoder on this adapter");
-        for activate in enumerate(adapter)? {
-            match Self::open(activate, device, width, height, fps, kbps) {
+        let codec = if hevc { "H.265" } else { "H.264" };
+        let mut last_error = anyhow!("no hardware {codec} encoder on this adapter");
+        for activate in enumerate(adapter, hevc)? {
+            match Self::open(activate, device, width, height, fps, kbps, hevc) {
                 Ok(encoder) => return Ok(encoder),
                 Err(e) => last_error = e,
             }
@@ -57,6 +65,7 @@ impl Encoder {
         height: u32,
         fps: u32,
         kbps: u32,
+        hevc: bool,
     ) -> Result<Self> {
         unsafe {
             let name = friendly_name(&activate);
@@ -95,13 +104,13 @@ impl Encoder {
 
             let output = MFCreateMediaType()?;
             output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            output.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            output.SetGUID(&MF_MT_SUBTYPE, if hevc { &MFVideoFormat_HEVC } else { &MFVideoFormat_H264 })?;
             output.SetUINT32(&MF_MT_AVG_BITRATE, kbps * 1000)?;
             output.SetUINT64(&MF_MT_FRAME_SIZE, pack(width, height))?;
             output.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1))?;
             output.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
             output.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-            output.SetUINT32(&MF_MT_MPEG2_PROFILE, H264_PROFILE_HIGH)?;
+            output.SetUINT32(&MF_MT_MPEG2_PROFILE, if hevc { HEVC_PROFILE_MAIN } else { H264_PROFILE_HIGH })?;
             mft.SetOutputType(0, &output, 0).context("encoder rejected the output format")?;
 
             let input = MFCreateMediaType()?;
@@ -135,6 +144,7 @@ impl Encoder {
                 frame_duration: 10_000_000 / fps as i64,
                 need_input: 0,
                 name,
+                hevc,
             })
         }
     }
@@ -222,7 +232,7 @@ impl Encoder {
             let bytes = std::slice::from_raw_parts(ptr, len as usize);
             let mut data = Vec::with_capacity(bytes.len() + self.sequence_header.len());
             // A decoder joining at this keyframe needs SPS/PPS in the stream.
-            if key && !begins_with_sps(bytes) {
+            if key && !begins_with_parameters(bytes, self.hevc) {
                 data.extend_from_slice(&self.sequence_header);
             }
             data.extend_from_slice(bytes);
@@ -258,7 +268,7 @@ fn pack(high: u32, low: u32) -> u64 {
     ((high as u64) << 32) | low as u64
 }
 
-fn enumerate(adapter: LUID) -> Result<Vec<IMFActivate>> {
+fn enumerate(adapter: LUID, hevc: bool) -> Result<Vec<IMFActivate>> {
     unsafe {
         let attrs = {
             let mut attrs = None;
@@ -274,7 +284,7 @@ fn enumerate(adapter: LUID) -> Result<Vec<IMFActivate>> {
 
         let output = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
-            guidSubtype: MFVideoFormat_H264,
+            guidSubtype: if hevc { MFVideoFormat_HEVC } else { MFVideoFormat_H264 },
         };
         let mut list = std::ptr::null_mut();
         let mut count = 0u32;
@@ -325,15 +335,21 @@ fn read_sequence_header(mft: &IMFTransform) -> Vec<u8> {
     }
 }
 
-/// True if SPS comes first, optionally after an access unit delimiter.
-fn begins_with_sps(data: &[u8]) -> bool {
+/// True if the parameter sets come first (SPS for H.264, VPS for H.265),
+/// optionally after an access unit delimiter.
+fn begins_with_parameters(data: &[u8], hevc: bool) -> bool {
     let mut seen = 0;
     let mut i = 0;
     while i + 3 < data.len() && seen < 2 {
         if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            match data[i + 3] & 0x1F {
-                NAL_SPS => return true,
-                NAL_AUD => seen += 1,
+            let (kind, parameters, delimiter) = if hevc {
+                ((data[i + 3] >> 1) & 0x3F, HEVC_NAL_VPS, HEVC_NAL_AUD)
+            } else {
+                (data[i + 3] & 0x1F, NAL_SPS, NAL_AUD)
+            };
+            match kind {
+                k if k == parameters => return true,
+                k if k == delimiter => seen += 1,
                 _ => return false,
             }
             i += 3;
@@ -350,17 +366,73 @@ mod tests {
 
     #[test]
     fn detects_sps_at_stream_start() {
-        assert!(begins_with_sps(&[0, 0, 0, 1, 0x67, 0x42]));
-        assert!(begins_with_sps(&[0, 0, 1, 0x67, 0x42]));
+        assert!(begins_with_parameters(&[0, 0, 0, 1, 0x67, 0x42], false));
+        assert!(begins_with_parameters(&[0, 0, 1, 0x67, 0x42], false));
         // After an access unit delimiter.
-        assert!(begins_with_sps(&[0, 0, 0, 1, 0x09, 0x10, 0, 0, 0, 1, 0x67, 0x42]));
+        assert!(begins_with_parameters(&[0, 0, 0, 1, 0x09, 0x10, 0, 0, 0, 1, 0x67, 0x42], false));
     }
 
     #[test]
     fn rejects_streams_without_leading_sps() {
-        assert!(!begins_with_sps(&[0, 0, 0, 1, 0x65, 0x88])); // IDR slice
-        assert!(!begins_with_sps(&[1, 2, 3]));
-        assert!(!begins_with_sps(&[]));
+        assert!(!begins_with_parameters(&[0, 0, 0, 1, 0x65, 0x88], false)); // IDR slice
+        assert!(!begins_with_parameters(&[1, 2, 3], false));
+        assert!(!begins_with_parameters(&[], false));
+    }
+
+    #[test]
+    fn hevc_parameter_sets_are_recognised() {
+        // VPS is NAL type 32: first byte 0x40.
+        assert!(begins_with_parameters(&[0, 0, 0, 1, 0x40, 0x01], true));
+        // After an access unit delimiter (type 35: 0x46).
+        assert!(begins_with_parameters(&[0, 0, 0, 1, 0x46, 0x01, 0x50, 0, 0, 0, 1, 0x40, 0x01], true));
+        // An IDR slice (type 19: 0x26) without parameters in front.
+        assert!(!begins_with_parameters(&[0, 0, 0, 1, 0x26, 0x01], true));
+    }
+
+    /// Encodes a blank picture with each codec the first graphics card has,
+    /// and checks that the keyframe starts with its parameter sets.
+    #[test]
+    fn encodes_a_keyframe_with_each_codec() {
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+            let _ = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+        }
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1().unwrap() };
+        let adapter = unsafe { factory.EnumAdapters1(0).unwrap() };
+        let luid = unsafe { adapter.GetDesc1().unwrap().AdapterLuid };
+        let (device, _context) = crate::d3d::create_device(Some(&adapter.cast::<IDXGIAdapter>().unwrap())).unwrap();
+        let texture = crate::d3d::create_texture(
+            &device,
+            640,
+            360,
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12,
+        )
+        .unwrap();
+        for hevc in [false, true] {
+            let mut encoder = match Encoder::new(&device, luid, 640, 360, 30, 2_000, hevc) {
+                Ok(encoder) => encoder,
+                Err(e) if hevc => {
+                    println!("no H.265 encoder here: {e:#}");
+                    continue;
+                }
+                Err(e) => panic!("H.264 encoder: {e:#}"),
+            };
+            let mut out = Vec::new();
+            let started = Instant::now();
+            while out.is_empty() && started.elapsed() < std::time::Duration::from_secs(3) {
+                encoder.poll(&mut out).unwrap();
+                if encoder.can_accept() {
+                    encoder.force_keyframe();
+                    encoder.submit(&texture).unwrap();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let (data, key) = out.first().expect("encoder produced a frame");
+            println!("{}: {} bytes, key {key}", encoder.name, data.len());
+            assert!(*key);
+            assert!(begins_with_parameters(data, hevc), "{:02x?}", &data[..data.len().min(16)]);
+        }
     }
 
     #[test]

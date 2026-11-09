@@ -1,9 +1,11 @@
-//! H.264 decoding with DXVA through Microsoft's decoder transform, in low
-//! latency mode so a frame comes out as soon as it goes in.
+//! H.264 or H.265 decoding with DXVA through Microsoft's decoder transforms,
+//! in low latency mode so a frame comes out as soon as it goes in.
 
 use anyhow::{anyhow, Result};
 use windows::core::{Interface, VARIANT};
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Device, ID3D11Texture2D, ID3D11VideoDevice, D3D11_DECODER_PROFILE_HEVC_VLD_MAIN,
+};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 
@@ -20,12 +22,37 @@ pub struct Decoder {
     width: u32,
     height: u32,
     sample_time: i64,
+    pub hevc: bool,
+}
+
+/// True when this PC can decode H.265 in hardware: the graphics card has the
+/// decoder profile and Windows has the HEVC extension that exposes it.
+pub fn hevc_supported() -> bool {
+    let check = || -> Result<bool> {
+        let (device, _) = crate::d3d::create_device(None)?;
+        unsafe {
+            let video: ID3D11VideoDevice = device.cast()?;
+            let profiles = video.GetVideoDecoderProfileCount();
+            let mut found = false;
+            for i in 0..profiles {
+                if video.GetVideoDecoderProfile(i)? == D3D11_DECODER_PROFILE_HEVC_VLD_MAIN {
+                    found = true;
+                }
+            }
+            if !found {
+                return Ok(false);
+            }
+            Ok(CoCreateInstance::<_, IMFTransform>(&CLSID_MSH265DecoderMFT, None, CLSCTX_INPROC_SERVER).is_ok())
+        }
+    };
+    check().unwrap_or(false)
 }
 
 impl Decoder {
-    pub fn new(device: &ID3D11Device) -> Result<Self> {
+    pub fn new(device: &ID3D11Device, hevc: bool) -> Result<Self> {
         unsafe {
-            let mft: IMFTransform = CoCreateInstance(&CLSID_MSH264DecoderMFT, None, CLSCTX_INPROC_SERVER)?;
+            let clsid = if hevc { &CLSID_MSH265DecoderMFT } else { &CLSID_MSH264DecoderMFT };
+            let mft: IMFTransform = CoCreateInstance(clsid, None, CLSCTX_INPROC_SERVER)?;
             let attrs = mft.GetAttributes()?;
             let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
             if let Ok(api) = mft.cast::<ICodecAPI>() {
@@ -41,11 +68,11 @@ impl Decoder {
 
             let input = MFCreateMediaType()?;
             input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            input.SetGUID(&MF_MT_SUBTYPE, if hevc { &MFVideoFormat_HEVC } else { &MFVideoFormat_H264 })?;
             input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             mft.SetInputType(0, &input, 0)?;
 
-            let mut decoder = Self { mft, _manager: manager, width: 0, height: 0, sample_time: 0 };
+            let mut decoder = Self { mft, _manager: manager, width: 0, height: 0, sample_time: 0, hevc };
             decoder.select_output()?;
             decoder.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             decoder.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
@@ -157,5 +184,29 @@ impl Decoder {
 impl Drop for Decoder {
     fn drop(&mut self) {
         let _ = unsafe { self.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reports what this PC offers; the answer depends on its hardware and
+    /// on whether the HEVC extension is installed, so nothing is asserted.
+    #[test]
+    fn reports_hevc_support() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+            let _ = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+        }
+        let (device, _) = crate::d3d::create_device(None).unwrap();
+        let profile = unsafe {
+            let video: ID3D11VideoDevice = device.cast().unwrap();
+            (0..video.GetVideoDecoderProfileCount())
+                .any(|i| video.GetVideoDecoderProfile(i).ok() == Some(D3D11_DECODER_PROFILE_HEVC_VLD_MAIN))
+        };
+        let mft = unsafe { CoCreateInstance::<_, IMFTransform>(&CLSID_MSH265DecoderMFT, None, CLSCTX_INPROC_SERVER) };
+        println!("HEVC decoder profile: {profile}, MFT: {:?}", mft.as_ref().map(|_| ()).map_err(|e| e.code()));
+        println!("hevc_supported: {}", hevc_supported());
     }
 }

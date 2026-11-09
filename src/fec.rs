@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 pub const HEADER: usize = 24;
 pub const FLAG_KEY: u8 = 1;
+/// The frame is H.265 rather than H.264.
+pub const FLAG_HEVC: u8 = 2;
 const MAX_DATA_SHARDS: usize = 64;
 const MAX_FRAME: usize = 32 * 1024 * 1024;
 /// How many newer frames may arrive before a missing one is declared lost.
@@ -164,6 +166,7 @@ pub struct Frame {
     pub id: u32,
     pub timestamp_us: u64,
     pub key: bool,
+    pub hevc: bool,
     pub data: Vec<u8>,
 }
 
@@ -179,6 +182,7 @@ struct Partial {
     frame_len: usize,
     timestamp_us: u64,
     key: bool,
+    hevc: bool,
     blocks: Vec<Option<Block>>,
     decoded_blocks: usize,
     complete: Option<Vec<u8>>,
@@ -243,6 +247,7 @@ impl Assembler {
             frame_len: h.frame_len as usize,
             timestamp_us: h.timestamp_us,
             key: h.flags & FLAG_KEY != 0,
+            hevc: h.flags & FLAG_HEVC != 0,
             blocks: (0..h.blocks).map(|_| None).collect(),
             decoded_blocks: 0,
             complete: None,
@@ -338,6 +343,7 @@ impl Assembler {
                     id,
                     timestamp_us: p.timestamp_us,
                     key: p.key,
+                    hevc: p.hevc,
                     data: p.complete.expect("checked above"),
                 });
                 continue;

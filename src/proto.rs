@@ -10,7 +10,7 @@ const MAX_MESSAGE: usize = 8 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ClientMsg {
-    Hello { max_bitrate_kbps: u32, fps: u32, clipboard: bool, audio: bool, pin: String },
+    Hello { max_bitrate_kbps: u32, fps: u32, clipboard: bool, audio: bool, hevc: bool, pin: String },
     /// Normalized to 0..=65535 across the captured monitor.
     MouseMove { x: u16, y: u16 },
     MouseButton { button: u8, down: bool },
@@ -39,6 +39,8 @@ pub enum HostMsg {
     Clipboard { text: String },
     Notice { text: String },
     Chat { text: String },
+    /// Adapters that can wake this PC; the client keeps them for later.
+    WakeInfo { macs: Vec<[u8; 6]> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

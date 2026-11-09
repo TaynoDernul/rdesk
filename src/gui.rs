@@ -31,6 +31,8 @@ const WM_SHOW: u32 = WM_APP + 3;
 const ID_TRAY_OPEN: usize = 201;
 const ID_TRAY_EXIT: usize = 202;
 const QUALITY_KBPS: [u32; 3] = [8_000, 20_000, 40_000];
+/// Set for the copy started by an update, which waits for the old one to exit.
+const AFTER_UPDATE: &str = "RDESK_AFTER_UPDATE";
 
 enum Event {
     PairCode(String),
@@ -38,6 +40,9 @@ enum Event {
     HostAdded(Result<String, String>),
     HostEnded(Option<String>),
     Note(String),
+    LanFound(Result<Vec<String>, String>),
+    UpdateChecked(Result<Option<crate::update::Available>, String>, bool),
+    UpdateInstalled(Result<std::path::PathBuf, String>),
 }
 
 struct HostRun {
@@ -54,6 +59,8 @@ struct App {
     tray: HWND,
     icon: HICON,
     tray_tip: RefCell<String>,
+    lan_ids: RefCell<Vec<String>>,
+    update: RefCell<Option<crate::update::Available>>,
 }
 
 thread_local! {
@@ -105,11 +112,12 @@ fn validate_new_host(id: &str, name: &str, code: &str) -> Result<(String, String
     Ok((id, name, code.to_string()))
 }
 
-fn devices(items: impl Iterator<Item = (String, String)>) -> ModelRc<Device> {
+fn devices(items: impl Iterator<Item = (String, String, bool)>) -> ModelRc<Device> {
     let rows: Vec<Device> = items
-        .map(|(name, id)| Device {
+        .map(|(name, id, wakeable)| Device {
             name: SharedString::from(name),
             detail: SharedString::from(format!("ID {}…", short_id(&id))),
+            wakeable,
         })
         .collect();
     ModelRc::new(VecModel::from(rows))
@@ -119,7 +127,19 @@ pub fn run(runtime: tokio::runtime::Runtime, id: Identity, background: bool) -> 
     // Named per profile, so a second double click reopens the running copy.
     let appdata = std::env::var("APPDATA").unwrap_or_default();
     let name = wide(&format!("Local\\rdesk-{}", crate::identity::fingerprint(appdata.as_bytes())));
-    let mutex = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr()))? };
+    let mut mutex = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr()))? };
+    if std::env::var_os(AFTER_UPDATE).is_some() {
+        std::env::remove_var(AFTER_UPDATE);
+        // The old version is shutting down; give it a few seconds to let go.
+        for _ in 0..50 {
+            if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+                break;
+            }
+            let _ = unsafe { CloseHandle(mutex) };
+            std::thread::sleep(Duration::from_millis(200));
+            mutex = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr()))? };
+        }
+    }
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         // No window means the holder is dying, so this copy takes over.
         if let Ok(existing) = unsafe { FindWindowW(CLASS, None) } {
@@ -133,6 +153,8 @@ pub fn run(runtime: tokio::runtime::Runtime, id: Identity, background: bool) -> 
     ui.set_theme_index(system::theme_setting() as i32);
     ui.invoke_apply_theme();
     ui.set_my_id(id.host_id().into());
+    ui.set_version(env!("CARGO_PKG_VERSION").into());
+    ui.set_auto_update(system::ui_flag("auto_update", true));
 
     let (tray, icon) = create_tray_window()?;
     let app = Rc::new(App {
@@ -144,6 +166,8 @@ pub fn run(runtime: tokio::runtime::Runtime, id: Identity, background: bool) -> 
         tray,
         icon,
         tray_tip: RefCell::new(String::new()),
+        lan_ids: RefCell::new(Vec::new()),
+        update: RefCell::new(None),
     });
     APP.with(|a| a.set(app.clone()).ok());
     add_tray(&app);
@@ -169,6 +193,10 @@ pub fn run(runtime: tokio::runtime::Runtime, id: Identity, background: bool) -> 
         slint::CloseRequestResponse::HideWindow
     });
 
+    crate::update::clean_up();
+    if system::ui_flag("auto_update", true) {
+        check_update(&app, false);
+    }
     if background {
         // Start at login: never prompt and stay in the tray.
         start_host(&app, false);
@@ -194,6 +222,18 @@ fn connect_callbacks(ui: &AppWindow) {
     ui.on_autostart_changed(|on| with_app(|app| toggle_autostart(app, on)));
     ui.on_confirm_changed(|on| with_app(|app| toggle_confirm(app, on)));
     ui.on_open_log(|| with_app(open_log));
+    ui.on_open_relay(|| with_app(open_relay));
+    ui.on_save_relay(|| with_app(save_relay));
+    ui.on_wake(|| with_app(wake_host));
+    ui.on_scan_lan(|| with_app(scan_lan));
+    ui.on_check_update(|| with_app(|app| check_update(app, true)));
+    ui.on_install_update(|| with_app(install_update));
+    ui.on_auto_update_changed(|on| {
+        if let Err(e) = system::save_ui_setting("auto_update", serde_json::json!(on)) {
+            crate::log_event(&format!("update setting not saved: {e:#}"));
+        }
+    });
+    ui.on_pick_lan(|index| with_app(|app| pick_lan(app, index)));
     ui.on_connect(|| with_app(connect));
     ui.on_forget(|index| with_app(|app| forget_host(app, index)));
     ui.on_clipboard_changed(|on| with_app(|app| toggle_clipboard(app, on)));
@@ -255,8 +295,8 @@ fn offer_reset_if_tampered() {
 fn refresh_lists(app: &App) {
     match Trust::load() {
         Ok(trust) => {
-            app.ui.set_clients(devices(trust.clients.iter().map(|c| (c.name.clone(), c.id.clone()))));
-            app.ui.set_hosts(devices(trust.hosts.iter().map(|h| (h.name.clone(), h.id.clone()))));
+            app.ui.set_clients(devices(trust.clients.iter().map(|c| (c.name.clone(), c.id.clone(), false))));
+            app.ui.set_hosts(devices(trust.hosts.iter().map(|h| (h.name.clone(), h.id.clone(), !h.macs.is_empty()))));
             if app.ui.get_selected_host() >= trust.hosts.len() as i32 || app.ui.get_selected_host() < 0 {
                 app.ui.set_selected_host(if trust.hosts.is_empty() { -1 } else { 0 });
             }
@@ -410,6 +450,113 @@ fn open_log(app: &Rc<App>) {
         .unwrap_or_default();
     app.ui.set_log_entries(ModelRc::new(VecModel::from(log_entries(&text))));
     app.ui.set_show_log(true);
+}
+
+fn open_relay(app: &Rc<App>) {
+    let current = system::ui_setting("relay").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+    app.ui.set_relay_url(current.into());
+    app.ui.set_relay_status(SharedString::new());
+    app.ui.set_show_relay(true);
+}
+
+fn save_relay(app: &Rc<App>) {
+    let text = app.ui.get_relay_url().trim().to_string();
+    let parsed = match net::parse_relay(&text) {
+        Ok(parsed) => parsed,
+        Err(e) => return app.ui.set_relay_status(format!("{e:#}").into()),
+    };
+    let value = parsed.map(|url| url.to_string()).unwrap_or_default();
+    match system::save_ui_setting("relay", serde_json::json!(value)) {
+        Ok(()) => {
+            crate::log_event(&format!("relay set to {}", if value.is_empty() { "n0" } else { &value }));
+            app.ui.set_show_relay(false);
+            let text = if value.is_empty() {
+                "Используются ретрансляторы n0. Перезапустите rdesk, чтобы применить."
+            } else {
+                "Ретранслятор сохранён. Перезапустите rdesk на обоих ПК, чтобы применить."
+            };
+            note(app, text);
+            app.ui.set_client_status(text.into());
+        }
+        Err(e) => app.ui.set_relay_status(format!("Не удалось сохранить: {e:#}").into()),
+    }
+}
+
+fn wake_host(app: &Rc<App>) {
+    let index = app.ui.get_selected_host();
+    let Some(host) = Trust::load().ok().and_then(|t| t.hosts.get(index.max(0) as usize).cloned()) else { return };
+    let status = match system::wake(&host.macs) {
+        Ok(()) => format!(
+            "Сигнал пробуждения отправлен «{}». Он работает в той же локальной сети, если пробуждение включено в BIOS и настройках сетевой карты. Подождите минуту и подключайтесь.",
+            host.name
+        ),
+        Err(e) => format!("Не удалось отправить сигнал: {e:#}"),
+    };
+    app.ui.set_client_status(status.into());
+}
+
+/// `asked`: the user pressed the button, so "up to date" is worth saying.
+fn check_update(app: &Rc<App>, asked: bool) {
+    app.ui.set_updating(true);
+    if asked {
+        app.ui.set_update_status("Проверяю…".into());
+    }
+    app.runtime.spawn(async move {
+        let result = crate::update::check().await.map_err(|e| format!("{e:#}"));
+        post(Event::UpdateChecked(result, asked));
+    });
+}
+
+fn install_update(app: &Rc<App>) {
+    let Some(update) = app.update.borrow().clone() else { return };
+    if app.host.borrow().is_some()
+        && !confirm("Сейчас этот ПК принимает подключения. После обновления rdesk перезапустится, а идущий сеанс прервётся. Продолжить?")
+    {
+        return;
+    }
+    app.ui.set_updating(true);
+    app.ui.set_update_status(format!("Скачиваю версию {}…", update.version).into());
+    app.runtime.spawn(async move {
+        let result = crate::update::install(&update).await.map_err(|e| format!("{e:#}"));
+        post(Event::UpdateInstalled(result));
+    });
+}
+
+fn scan_lan(app: &Rc<App>) {
+    app.ui.set_scanning(true);
+    app.ui.set_lan_hosts(ModelRc::default());
+    app.runtime.spawn(async {
+        let found = net::scan_local(Duration::from_secs(4)).await;
+        post(Event::LanFound(found.map_err(|e| format!("{e:#}"))));
+    });
+}
+
+fn show_lan_hosts(app: &Rc<App>, found: Result<Vec<String>, String>) {
+    app.ui.set_scanning(false);
+    let found = match found {
+        Ok(found) => found,
+        Err(message) => return app.ui.set_client_status(message.into()),
+    };
+    let known: Vec<String> = Trust::load().map(|t| t.hosts.into_iter().map(|h| h.id).collect()).unwrap_or_default();
+    let mine = app.id.host_id();
+    let fresh: Vec<String> = found.into_iter().filter(|id| *id != mine && !known.contains(id)).collect();
+    if fresh.is_empty() {
+        app.ui.set_client_status(
+            "В локальной сети не найдено новых ПК. На нужном ПК должны быть включены подключения в rdesk.".into(),
+        );
+    } else {
+        app.ui.set_client_status(SharedString::new());
+    }
+    app.ui.set_lan_hosts(devices(fresh.iter().map(|id| ("ПК в локальной сети".to_string(), id.clone(), false))));
+    // The rows show a short ID; the full one is kept here for picking.
+    *app.lan_ids.borrow_mut() = fresh;
+}
+
+fn pick_lan(app: &Rc<App>, index: i32) {
+    if let Some(id) = app.lan_ids.borrow().get(index.max(0) as usize) {
+        app.ui.set_new_id(id.clone().into());
+        app.ui.set_client_status("ID подставлен. Введите название и код с того ПК.".into());
+    }
 }
 
 fn toggle_autostart(app: &Rc<App>, wanted: bool) {
@@ -611,6 +758,40 @@ fn handle_event(app: &Rc<App>, event: Event) {
             refresh_status(app);
         }
         Event::Note(text) => note(app, &text),
+        Event::LanFound(found) => show_lan_hosts(app, found),
+        Event::UpdateChecked(result, asked) => {
+            app.ui.set_updating(false);
+            match result {
+                Ok(Some(update)) => {
+                    app.ui.set_update_version(update.version.clone().into());
+                    app.ui.set_update_status(
+                        format!("Доступна версия {}. Обновите её на всех своих ПК: версии должны совпадать.", update.version)
+                            .into(),
+                    );
+                    *app.update.borrow_mut() = Some(update);
+                }
+                Ok(None) if asked => app.ui.set_update_status("Установлена последняя версия.".into()),
+                Ok(None) => {}
+                Err(message) if asked => app.ui.set_update_status(format!("Не удалось проверить: {message}").into()),
+                Err(message) => crate::log_event(&format!("update check: {message}")),
+            }
+        }
+        Event::UpdateInstalled(result) => {
+            app.ui.set_updating(false);
+            match result {
+                Ok(exe) => {
+                    // The new copy takes over: this one ends its sessions and quits.
+                    let started = std::process::Command::new(exe).env(AFTER_UPDATE, "1").spawn();
+                    match started {
+                        Ok(_) => quit(app),
+                        Err(e) => app.ui.set_update_status(
+                            format!("Обновление установлено, но не запустилось: {e}. Запустите rdesk заново.").into(),
+                        ),
+                    }
+                }
+                Err(message) => app.ui.set_update_status(format!("Не удалось обновить: {message}").into()),
+            }
+        }
     }
 }
 
@@ -782,7 +963,7 @@ mod tests {
     #[test]
     fn device_rows_show_short_ids() {
         use slint::Model;
-        let model = devices(std::iter::once(("Дом".to_string(), "abcdef0123456789".to_string())));
+        let model = devices(std::iter::once(("Дом".to_string(), "abcdef0123456789".to_string(), true)));
         let row = model.row_data(0).unwrap();
         assert_eq!(row.name, "Дом");
         assert_eq!(row.detail, "ID abcdef01…");

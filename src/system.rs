@@ -184,6 +184,76 @@ pub fn save_ui_setting(key: &str, value: serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// MAC addresses of this PC's wired and wireless adapters that are up, for
+/// waking it over the network later. Virtual adapters are left out.
+pub fn local_macs() -> Vec<[u8; 6]> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+        IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows::Win32::Networking::WinSock::AF_UNSPEC;
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size = 16 * 1024u32;
+    let mut buffer: Vec<u64> = Vec::new();
+    for _ in 0..3 {
+        buffer = vec![0u64; size as usize / 8 + 1];
+        let status = unsafe {
+            GetAdaptersAddresses(AF_UNSPEC.0 as u32, flags, None, Some(buffer.as_mut_ptr() as *mut _), &mut size)
+        };
+        if status == ERROR_SUCCESS.0 {
+            break;
+        }
+        if status != windows::Win32::Foundation::ERROR_BUFFER_OVERFLOW.0 {
+            return Vec::new();
+        }
+    }
+    let mut macs = Vec::new();
+    let mut next = buffer.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    while let Some(adapter) = unsafe { next.as_ref() } {
+        let physical = matches!(adapter.IfType, IF_TYPE_ETHERNET_CSMACD | IF_TYPE_IEEE80211);
+        let description = unsafe { adapter.Description.to_string() }.unwrap_or_default().to_lowercase();
+        let is_virtual = ["virtual", "hyper-v", "vmware", "virtualbox", "tap-", "wintun", "wireguard", "vpn"]
+            .iter()
+            .any(|word| description.contains(word));
+        if physical && !is_virtual && adapter.OperStatus == IfOperStatusUp && adapter.PhysicalAddressLength == 6 {
+            let mut mac = [0u8; 6];
+            mac.copy_from_slice(&adapter.PhysicalAddress[..6]);
+            if !macs.contains(&mac) {
+                macs.push(mac);
+            }
+        }
+        next = adapter.Next;
+    }
+    macs
+}
+
+/// The Wake-on-LAN magic packet: six 0xFF bytes and the address 16 times.
+pub fn magic_packet(mac: [u8; 6]) -> Vec<u8> {
+    let mut packet = vec![0xFF; 6];
+    for _ in 0..16 {
+        packet.extend_from_slice(&mac);
+    }
+    packet
+}
+
+/// Sends magic packets as broadcasts. They reach the sleeping PC only on the
+/// same local network, and only if waking is enabled in its BIOS and adapter.
+pub fn wake(macs: &[[u8; 6]]) -> Result<()> {
+    let socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
+    socket.set_broadcast(true)?;
+    for _ in 0..3 {
+        for mac in macs {
+            let packet = magic_packet(*mac);
+            for port in [9u16, 7] {
+                socket.send_to(&packet, ("255.255.255.255", port))?;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(())
+}
+
 /// "08.11 14:03" in this PC's time zone, for the connection log.
 pub fn local_time_text(unix_secs: u64) -> String {
     use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
@@ -279,6 +349,21 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn magic_packet_has_the_standard_layout() {
+        let mac = [1, 2, 3, 4, 5, 6];
+        let packet = magic_packet(mac);
+        assert_eq!(packet.len(), 102);
+        assert_eq!(&packet[..6], &[0xFF; 6]);
+        assert!(packet[6..].chunks(6).all(|c| c == mac));
+    }
+
+    #[test]
+    fn this_pc_reports_its_adapters() {
+        // A test machine has a network adapter; none of them may be all zeros.
+        assert!(local_macs().iter().all(|m| m != &[0u8; 6]));
+    }
 
     const TEST_KEY: &str = "Software\\rdesk-test";
 
